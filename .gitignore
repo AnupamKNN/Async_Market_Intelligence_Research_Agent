@@ -1,0 +1,124 @@
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Python testing and linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ==========================================
+# Environment variables and secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.*.example
+.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# ==========================================
+# Datasets
+# Keep directory placeholders, not actual datasets
+# ==========================================
+/data/**
+!/data/**/
+!/data/**/.gitkeep
+
+# ==========================================
+# Model artifacts and generated files
+# Keep directory placeholders, not binaries
+# ==========================================
+/artifacts/**
+!/artifacts/**/
+!/artifacts/**/.gitkeep
+
+*.pt
+*.pth
+*.ckpt
+*.keras
+*.h5
+*.onnx
+*.safetensors
+*.joblib
+*.pickle
+
+# ML experiment tracking
+wandb/
+mlruns/
+runs/
+lightning_logs/
+tensorboard/
+checkpoints/
+
+# Model and embedding caches
+.cache/
+huggingface_cache/
+
+# ==========================================
+# Jupyter
+# ==========================================
+.ipynb_checkpoints/
+
+# ==========================================
+# Logs and temporary files
+# ==========================================
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ==========================================
+# React / Node.js
+# ==========================================
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.vite/
+frontend/.next/
+frontend/.turbo/
+frontend/coverage/
+
+# ==========================================
+# IDE and operating system
+# ==========================================
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Serialized Python objects and local databases
+*.pkl
+*.db
+*.sqlite
+*.sqlite3
