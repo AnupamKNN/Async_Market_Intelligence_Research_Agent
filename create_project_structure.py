@@ -1,4 +1,3 @@
-
 from pathlib import Path
 
 
@@ -11,8 +10,7 @@ def create_project_structure() -> None:
     # Prevent accidentally creating the structure in the wrong directory.
     if not (project_root / "pyproject.toml").exists():
         raise FileNotFoundError(
-            "pyproject.toml not found. "
-            "Place this script in the project root and run it again."
+            "pyproject.toml not found. Place this script in the project root and run it again."
         )
 
     # Directories that should be importable Python packages.

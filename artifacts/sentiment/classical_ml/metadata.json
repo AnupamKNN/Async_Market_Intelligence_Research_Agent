@@ -1,0 +1,29 @@
+{
+    "model_name": "Logistic Regression",
+    "model_type": "classical_ml",
+    "feature_extraction": "word_char_tfidf",
+    "hyperparameters": {
+        "C": 1.0,
+        "solver": "liblinear",
+        "max_iter": 3000
+    },
+    "training_samples": 2400,
+    "training_sources": [
+        "amazon",
+        "imdb",
+        "yelp"
+    ],
+    "label_mapping": {
+        "0": "negative",
+        "1": "positive"
+    },
+    "test_metrics": {
+        "accuracy": 0.85,
+        "balanced_accuracy": 0.85,
+        "macro_precision": 0.8505608974358975,
+        "macro_recall": 0.85,
+        "macro_f1": 0.8499399759903962,
+        "roc_auc": 0.9262111111111111,
+        "average_precision": 0.9306202560003211
+    }
+}
