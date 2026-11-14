@@ -15,6 +15,7 @@ from market_intelligence.core.config import PROJECT_ROOT
 SERVER_MODULES = {
     "analytics": "market_intelligence.mcp.internal_analytics.server",
     "research": "market_intelligence.mcp.external_research.server",
+    "sentiment": "market_intelligence.mcp.sentiment_server",
 }
 
 

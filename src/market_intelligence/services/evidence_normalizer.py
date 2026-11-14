@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 
 from market_intelligence.schemas.evidence import (
     EvidenceBundle,
@@ -83,6 +83,11 @@ def _parse_date(value: str | date, field_name: str) -> date:
 
 def normalize_fred_response(
     response: dict[str, Any],
+    *,
+    temporal_scope: Literal[
+        "historical_comparison",
+        "current_context",
+    ] = "historical_comparison",
 ) -> EvidenceBundle:
     """Convert a FRED series response into one evidence record per observation.
 
@@ -147,6 +152,7 @@ def normalize_fred_response(
             "requested_transformation": transformation,
             "observation_date": observation_date.isoformat(),
             "value": value,
+            "temporal_scope": temporal_scope,
         }
 
         evidence_id = _stable_id(

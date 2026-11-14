@@ -6,13 +6,22 @@ import asyncio
 import json
 import re
 from collections.abc import Sequence
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
 from langchain_core.tools import StructuredTool
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import START, StateGraph
 
+from market_intelligence.core.config import Settings
+from market_intelligence.orchestration.analyst import create_analyst_node
+from market_intelligence.orchestration.collector import create_collector_node
 from market_intelligence.orchestration.state import ResearchState
+from market_intelligence.orchestration.supervisor import create_supervisor_node
+from market_intelligence.services.crag import (
+    assess_crag_quality,
+    build_corrective_news_query,
+)
 from market_intelligence.services.evidence_normalizer import (
     normalize_fred_response,
     normalize_gnews_response,
@@ -129,6 +138,117 @@ def _parse_tool_output(result: Any) -> Any:
         raise ValueError("Expected a JSON object or array from the MCP tool.")
 
     return decoded
+
+
+def calculate_quantitative_metrics(
+    internal_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Calculate and validate quantitative metrics deterministically."""
+
+    def to_decimal(value: Any, field_name: str) -> Decimal:
+        if value is None:
+            raise ValueError(f"Missing numeric field: {field_name}")
+
+        try:
+            number = Decimal(str(value))
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            raise ValueError(f"Invalid numeric field: {field_name}") from exc
+
+        if not number.is_finite():
+            raise ValueError(f"Non-finite numeric field: {field_name}")
+
+        return number
+
+    sales = internal_data.get("sales_summary")
+    overview = internal_data.get("dataset_overview", {})
+
+    if not sales:
+        return {
+            "status": "not_available",
+            "reason": "No internal sales summary was retrieved.",
+        }
+
+    positive = to_decimal(sales["positive_line_value"], "positive_line_value")
+    negative = to_decimal(sales["negative_adjustment_value"], "negative_adjustment_value")
+    net = to_decimal(sales["net_line_value"], "net_line_value")
+
+    calculated_net = positive + negative
+    reconciliation_passed = calculated_net == net
+
+    # Normalize the top-products response.
+    products = internal_data.get("top_products", [])
+
+    if isinstance(products, dict) and set(products) == {"result"}:
+        products = products["result"]
+
+    if not isinstance(products, list):
+        products = []
+
+    products = [product for product in products if isinstance(product, dict)]
+
+    product_values = [
+        to_decimal(product.get("net_line_value"), "top_product.net_line_value")
+        for product in products
+    ]
+
+    retrieved_products_total = sum(product_values, Decimal("0"))
+
+    product_share = (
+        (retrieved_products_total / net * Decimal("100")).quantize(Decimal("0.01"))
+        if net != 0
+        else None
+    )
+
+    products_sorted = all(
+        product_values[index] >= product_values[index + 1]
+        for index in range(len(product_values) - 1)
+    )
+
+    # Source metrics are preserved separately from derived metrics.
+    source_metrics = {
+        "net_quantity": (
+            str(to_decimal(sales["net_quantity"], "net_quantity"))
+            if sales.get("net_quantity") is not None
+            else None
+        ),
+        "transaction_lines": sales.get("transaction_lines"),
+        "unique_invoices": overview.get("unique_invoices"),
+        "unique_products": overview.get("unique_products"),
+        "unique_customers": overview.get("unique_customers"),
+        "unique_countries": overview.get("unique_countries"),
+    }
+
+    derived_metrics = {
+        "retrieved_products_count": len(products),
+        "retrieved_products_net_line_value": str(retrieved_products_total),
+        "retrieved_products_share_of_net_line_value_pct": (
+            str(product_share) if product_share is not None else None
+        ),
+    }
+
+    return {
+        "status": "validated" if reconciliation_passed else "reconciliation_failed",
+        "positive_line_value": str(positive),
+        "negative_adjustment_value": str(negative),
+        "calculated_net_line_value": str(calculated_net),
+        "reported_net_line_value": str(net),
+        "reconciliation_difference": str(calculated_net - net),
+        "reconciliation_passed": reconciliation_passed,
+        "source_metrics": source_metrics,
+        "derived_metrics": derived_metrics,
+        "validation_checks": {
+            "net_value_reconciliation_passed": reconciliation_passed,
+            "retrieved_products_sorted_by_net_line_value": products_sorted,
+        },
+        "metric_scope": (
+            "Product contribution covers only the products returned "
+            "by the top-products retrieval, not the entire product catalog."
+        ),
+        "interpretation": (
+            "Net line value includes positive transactions and negative "
+            "adjustments. It is not independently verified accounting revenue."
+        ),
+    }
 
 
 def _validate_date_inputs(state: ResearchState) -> None:
@@ -294,6 +414,8 @@ def _plan_research(state: ResearchState) -> dict[str, Any]:
 
 def build_research_graph(
     tools: Sequence[StructuredTool],
+    *,
+    settings: Settings | None = None,
 ):
     """Build and compile the market intelligence LangGraph workflow.
 
@@ -495,32 +617,62 @@ def build_research_graph(
 
             return _parse_tool_output(raw)
 
-        series_ids = state.get("planned_fred_series", [])
+        historical_series_ids = state.get(
+            "planned_historical_fred_series"
+        )
 
-        if series_ids:
+        if historical_series_ids is None:
+            historical_series_ids = state.get("planned_fred_series", [])
+
+        current_series_ids = state.get(
+            "planned_current_fred_series", []
+        )
+
+        # Historical observations: align with the dataset window.
+        if historical_series_ids:
             if (
                 state.get("date_range_valid")
                 and state.get("effective_start_date")
                 and state.get("effective_end_date")
             ):
-                date_arguments = {
+                historical_arguments = {
                     "observation_start": state["effective_start_date"],
                     "observation_end": state["effective_end_date"],
                     "limit": 1000,
                     "sort_order": "asc",
                 }
 
-                for series_id in series_ids:
+                for series_id in historical_series_ids:
                     tasks.append(
                         (
-                            f"FRED:{series_id}",
-                            fetch_fred(series_id, date_arguments),
+                            f"FRED:HISTORICAL:{series_id}",
+                            fetch_fred(series_id, historical_arguments),
                         )
                     )
             else:
                 errors.append(
-                    "FRED retrieval skipped because a valid dataset "
-                    "comparison window is unavailable."
+                    "Historical FRED retrieval skipped because "
+                    "the dataset comparison window is unavailable."
+                )
+
+        # Current observations: independently retrieve the latest two years.
+        if current_series_ids:
+            current_end = date.today()
+            current_start = current_end - timedelta(days=730)
+
+            current_arguments = {
+                "observation_start": current_start.isoformat(),
+                "observation_end": current_end.isoformat(),
+                "limit": 1000,
+                "sort_order": "asc",
+            }
+
+            for series_id in current_series_ids:
+                tasks.append(
+                    (
+                        f"FRED:CURRENT:{series_id}",
+                        fetch_fred(series_id, current_arguments),
+                    )
                 )
 
         news_query = state.get("planned_news_query")
@@ -559,7 +711,18 @@ def build_research_graph(
 
             try:
                 if label.startswith("FRED:"):
-                    bundle = normalize_fred_response(outcome)
+                    temporal_label = label.split(":")[1]
+
+                    temporal_scope = (
+                        "current_context"
+                        if temporal_label == "CURRENT"
+                        else "historical_comparison"
+                    )
+
+                    bundle = normalize_fred_response(
+                        outcome,
+                        temporal_scope=temporal_scope,
+                    )
                 else:
                     bundle = normalize_gnews_response(outcome)
 
@@ -620,7 +783,151 @@ def build_research_graph(
         }
 
     # ---------------------------------------------------------------
-    # Node 4: Deterministic quantitative analysis
+    # Node 4: Corrective RAG evaluation
+    # ---------------------------------------------------------------
+
+    def evaluate_crag(
+        state: ResearchState,
+    ) -> dict[str, Any]:
+        """Evaluate retrieval quality and decide whether to retry."""
+
+        decision = assess_crag_quality(
+            state.get("research_quality", {}),
+            include_external=state.get("include_external", False),
+            include_news=state.get("include_news", False),
+            planned_news_query=state.get("planned_news_query"),
+            attempts=state.get("crag_attempts", 0),
+        )
+
+        updates: dict[str, Any] = {
+            "crag_status": decision["status"],
+            "crag_reason": decision["reason"],
+        }
+
+        if decision["should_retry"]:
+            next_attempt = state.get("crag_attempts", 0) + 1
+
+            updates["crag_corrected_news_query"] = (
+                build_corrective_news_query(
+                    question=state.get("question", ""),
+                    original_query=state.get("planned_news_query"),
+                    target_geography=state.get("target_geography"),
+                    attempt=next_attempt,
+                    reason=decision["reason"],
+                )
+            )
+
+        return updates
+
+    def route_after_crag(state: ResearchState) -> str:
+        """Select corrective retrieval or normal execution."""
+
+        if state.get("crag_status") == "retry_required":
+            return "retry"
+
+        return "continue"
+
+    # ---------------------------------------------------------------
+    # Node 5: Corrective external retrieval
+    # ---------------------------------------------------------------
+
+    async def retrieve_corrective_external(
+        state: ResearchState,
+    ) -> dict[str, Any]:
+        """Retrieve additional news using the corrected CRAG query."""
+
+        query = state.get("crag_corrected_news_query", "")
+        attempt = state.get("crag_attempts", 0) + 1
+
+        if not query:
+            return {
+                "crag_attempts": attempt,
+                "crag_status": "retry_failed",
+                "errors": [
+                    "CRAG corrective retrieval skipped: corrected query is empty."
+                ],
+            }
+
+        try:
+            arguments = {
+                "query": query[:200],
+                "lang": "en",
+                "max_articles": min(
+                    max(state.get("max_articles", 5), 1),
+                    10,
+                ),
+                "sort_by": "publishedAt",
+            }
+
+            raw = await tool_map[
+                "research__search_market_news"
+            ].ainvoke(arguments)
+
+            parsed = _parse_tool_output(raw)
+            bundle = normalize_gnews_response(parsed)
+
+            new_bundle = bundle.model_dump(mode="json")
+            new_evidence = [
+                item.model_dump(mode="json")
+                for item in bundle.items
+            ]
+
+            # Preserve original evidence and append only new evidence.
+            merged_bundles = list(state.get("external_bundles", []))
+            existing_bundle_ids = {
+                item.get("bundle_id")
+                for item in merged_bundles
+                if item.get("bundle_id")
+            }
+
+            new_bundle_id = new_bundle.get("bundle_id")
+
+            if (
+                not new_bundle_id
+                or new_bundle_id not in existing_bundle_ids
+            ):
+                merged_bundles.append(new_bundle)
+
+            merged_evidence = list(state.get("external_evidence", []))
+            existing_evidence_ids = {
+                item.get("evidence_id")
+                for item in merged_evidence
+                if item.get("evidence_id")
+            }
+
+            for item in new_evidence:
+                evidence_id = item.get("evidence_id")
+
+                if (
+                    not evidence_id
+                    or evidence_id not in existing_evidence_ids
+                ):
+                    merged_evidence.append(item)
+
+                    if evidence_id:
+                        existing_evidence_ids.add(evidence_id)
+
+            return {
+                "external_bundles": merged_bundles,
+                "external_evidence": merged_evidence,
+                "crag_attempts": attempt,
+                "crag_status": "retrieval_completed",
+            }
+
+        except Exception as exc:
+            return {
+                "crag_attempts": attempt,
+                "crag_status": "retry_failed",
+                "errors": [
+                    (
+                        "CRAG corrective retrieval failed: "
+                        f"{type(exc).__name__}: {str(exc)[:300]}"
+                    )
+                ],
+            }
+
+    # ---------------------------------------------------------------
+    # Node 6: Deterministic quantitative analysis
     # ---------------------------------------------------------------
 
     def quantitative_analysis(
@@ -628,41 +935,12 @@ def build_research_graph(
     ) -> dict[str, Any]:
         """Reconcile deterministic SQL outputs using Decimal."""
 
-        sales = state.get("internal_data", {}).get("sales_summary")
-
-        if not sales:
-            return {
-                "quantitative_analysis": {
-                    "status": "not_available",
-                    "reason": "No internal sales summary was retrieved.",
-                }
-            }
-
-        positive = Decimal(sales["positive_line_value"])
-        negative = Decimal(sales["negative_adjustment_value"])
-        net = Decimal(sales["net_line_value"])
-
-        calculated_net = positive + negative
-
         return {
-            "quantitative_analysis": {
-                "status": ("validated" if calculated_net == net else "reconciliation_failed"),
-                "positive_line_value": str(positive),
-                "negative_adjustment_value": str(negative),
-                "calculated_net_line_value": str(calculated_net),
-                "reported_net_line_value": str(net),
-                "reconciliation_difference": str(calculated_net - net),
-                "reconciliation_passed": calculated_net == net,
-                "interpretation": (
-                    "Net line value includes positive transactions "
-                    "and negative adjustments. It is not independently "
-                    "verified accounting revenue."
-                ),
-            }
+            "quantitative_analysis": calculate_quantitative_metrics(state.get("internal_data", {}))
         }
 
     # ---------------------------------------------------------------
-    # Node 5: Research synthesis
+    # Node 7: Research synthesis
     # ---------------------------------------------------------------
 
     def synthesize_report(
@@ -834,13 +1112,102 @@ def build_research_graph(
             ]
         )
 
+        collector_findings = state.get("collector_findings", {})
+
+        if collector_findings:
+            sections.extend(
+                [
+                    "",
+                    "## 6. Research objective coverage",
+                    "",
+                ]
+            )
+
+            for assessment in collector_findings.get("objective_assessments", []):
+                sections.extend(
+                    [
+                        f"### {assessment['objective']}",
+                        f"- Status: {assessment['status']}",
+                        f"- Assessment: {assessment['explanation']}",
+                    ]
+                )
+
+                if assessment["evidence_ids"]:
+                    sections.append(f"- Evidence IDs: {', '.join(assessment['evidence_ids'])}")
+
+                sections.append("")
+
+            limitations = collector_findings.get("limitations", [])
+
+            if limitations:
+                sections.append("### Collection limitations")
+                sections.extend(f"- {item}" for item in limitations)
+
+        analyst_findings = state.get("analyst_findings", {})
+
+        if analyst_findings:
+            sections.extend(
+                [
+                    "",
+                    "## 7. Analytical interpretation",
+                    "",
+                    "### Executive summary",
+                    "",
+                    analyst_findings["executive_summary"],
+                    "",
+                    "### Analytical findings",
+                    "",
+                ]
+            )
+
+            for finding in analyst_findings.get("findings", []):
+                sections.extend(
+                    [
+                        f"#### {finding['objective']}",
+                        f"- Status: {finding['status']}",
+                        f"- Finding: {finding['finding']}",
+                        f"- Business implication: {finding['business_implication']}",
+                    ]
+                )
+
+                if finding["supporting_fields"]:
+                    sections.append(
+                        f"- Supporting fields: {', '.join(finding['supporting_fields'])}"
+                    )
+
+                if finding["limitation"]:
+                    sections.append(f"- Limitation: {finding['limitation']}")
+
+                sections.append("")
+
+            recommendations = analyst_findings.get("recommendations", [])
+
+            if recommendations:
+                sections.extend(["### Recommendations", ""])
+                sections.extend(f"- {item}" for item in recommendations)
+
+            limitations = analyst_findings.get("limitations", [])
+
+            if limitations:
+                sections.extend(["", "### Analytical limitations", ""])
+                sections.extend(f"- {item}" for item in limitations)
+
+            sections.extend(
+                [
+                    "",
+                    f"**Analyst confidence:** {analyst_findings['confidence']}",
+                ]
+            )
+
         errors = state.get("errors", [])
+
+        warning_section = 8 if analyst_findings else 7 if collector_findings else 6
 
         if errors:
             sections.extend(
                 [
                     "",
-                    "## 6. Retrieval warnings",
+                    f"## {warning_section}. Retrieval warnings",
                     "",
                 ]
             )
@@ -855,11 +1222,27 @@ def build_research_graph(
     # Build the graph
     # ---------------------------------------------------------------
 
+    planner_node = create_supervisor_node(settings) if settings is not None else _plan_research
+
+    collector_node = create_collector_node(settings) if settings is not None else None
+
+    analyst_node = create_analyst_node(settings) if settings is not None else None
+
     builder = StateGraph(ResearchState)
 
-    builder.add_node("plan_research", _plan_research)
+    if collector_node is not None:
+        builder.add_node("collector", collector_node)
+
+    if analyst_node is not None:
+        builder.add_node("analyst", analyst_node)
+    builder.add_node("plan_research", planner_node)
     builder.add_node("load_dataset_context", load_dataset_context)
     builder.add_node("retrieve_internal", retrieve_internal)
+    builder.add_node("evaluate_crag", evaluate_crag)
+    builder.add_node(
+        "retrieve_corrective_external",
+        retrieve_corrective_external,
+    )
     builder.add_node("retrieve_external", retrieve_external)
     builder.add_node("grade_evidence", grade_evidence)
     builder.add_node("quantitative_analysis", quantitative_analysis)
@@ -880,8 +1263,26 @@ def build_research_graph(
         "grade_evidence",
     )
 
-    builder.add_edge("grade_evidence", "quantitative_analysis")
-    builder.add_edge("quantitative_analysis", "synthesize_report")
-    builder.add_edge("synthesize_report", END)
+    builder.add_edge("grade_evidence", "evaluate_crag")
+
+    builder.add_conditional_edges(
+        "evaluate_crag",
+        route_after_crag,
+        {
+            "retry": "retrieve_corrective_external",
+            "continue": "quantitative_analysis",
+        },
+    )
+
+    builder.add_edge(
+        "retrieve_corrective_external",
+        "grade_evidence",
+    )
+    if collector_node is not None and analyst_node is not None:
+        builder.add_edge("quantitative_analysis", "collector")
+        builder.add_edge("collector", "analyst")
+        builder.add_edge("analyst", "synthesize_report")
+    else:
+        builder.add_edge("quantitative_analysis", "synthesize_report")
 
     return builder.compile()

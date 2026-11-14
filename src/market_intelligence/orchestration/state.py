@@ -25,30 +25,40 @@ class ResearchState(TypedDict, total=False):
     planned_fred_series: list[str]
     planned_news_query: str | None
     target_geography: str | None
-    target_geography: str | None
+    planned_historical_fred_series: list[str]
+    planned_current_fred_series: list[str]
+
+    # Dataset context
+    dataset_overview: dict[str, Any]
+    effective_start_date: str | None
+    effective_end_date: str | None
+    date_range_valid: bool
 
     # Retrieval results
-    dataset_overview: dict[str, Any]
-    effective_start_date: str | None
-    effective_end_date: str | None
-    date_range_valid: bool
-    dataset_overview: dict[str, Any]
-    effective_start_date: str | None
-    effective_end_date: str | None
-    date_range_valid: bool
     internal_data: dict[str, Any]
     external_bundles: list[dict[str, Any]]
     external_evidence: list[dict[str, Any]]
 
-    # Evidence and analytics
+    # Evidence and quantitative analytics
     evidence_grade: dict[str, Any]
     research_quality: dict[str, Any]
-    research_quality: dict[str, Any]
     quantitative_analysis: dict[str, Any]
+
+    # Agent outputs
+    collector_findings: dict[str, Any]
+    analyst_findings: dict[str, Any]
+    supervisor_decision: dict[str, Any]
+    synthesis_context: dict[str, Any]
+
+    # CRAG
+    crag_status: str
+    crag_attempts: int
+    crag_reason: str
+    crag_corrected_news_query: str
 
     # Final output
     report: str
     synthesis_mode: str
 
-    # Parallel branches can both append errors.
+    # Parallel branches and agent failures
     errors: Annotated[list[str], operator.add]

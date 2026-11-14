@@ -49,3 +49,4 @@ def test_invalid_sentiment_request(
     )
 
     assert response.status_code == 422
+
