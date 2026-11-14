@@ -135,3 +135,5 @@ data/processed/*
 
 data/external/*
 !data/external/.gitkeep
+
+test.txt
