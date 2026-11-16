@@ -137,3 +137,5 @@ data/external/*
 !data/external/.gitkeep
 
 test.txt
+auth-cookies.txt
+login-cookies.txt
