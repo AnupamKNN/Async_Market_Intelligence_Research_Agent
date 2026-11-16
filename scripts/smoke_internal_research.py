@@ -14,8 +14,7 @@ async def main():
         result = await graph.ainvoke(
             {
                 "question": (
-                    "Analyze overall retail sales performance "
-                    "and identify the top 5 products."
+                    "Analyze overall retail sales performance and identify the top 5 products."
                 ),
                 "requested_sources": ["internal"],
                 "product_limit": 5,
