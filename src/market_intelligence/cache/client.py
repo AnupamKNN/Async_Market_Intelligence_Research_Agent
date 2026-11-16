@@ -17,7 +17,7 @@ def create_redis_client(settings: Settings) -> Redis:
         password=password or None,
         decode_responses=True,
         socket_connect_timeout=5,
-        socket_timeout=5,
+        socket_timeout=30,
         health_check_interval=30,
         max_connections=20,
     )

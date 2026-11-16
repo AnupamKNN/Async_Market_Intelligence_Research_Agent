@@ -16,7 +16,7 @@ def build_mock_tools(news_responses=None, news_queries=None):
     async def wait_for_parallel_peer(name: str) -> None:
         calls_started.add(name)
 
-        if len(calls_started) == 2:
+        if len(calls_started) == 3:
             both_started.set()
 
         await asyncio.wait_for(both_started.wait(), timeout=2)
@@ -51,8 +51,45 @@ def build_mock_tools(news_responses=None, news_queries=None):
                 "stock_code": "22423",
                 "description": "Product A",
                 "net_line_value": "100.00",
+                "positive_line_value": "100.00",
+                "negative_adjustment_value": "0.00",
+                "total_positive_line_value": "1000.00",
+                "positive_line_value_share_pct": "10.00",
             }
         ][:limit]
+
+    async def monthly_sales_analysis(start_date: str, end_date: str):
+        await wait_for_parallel_peer("monthly")
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "monthly_trend": [
+                {
+                    "month": "2011-01",
+                    "month_label": "Jan 2011",
+                    "net_line_value": "900.00",
+                    "mom_change_pct": "10.00",
+                    "yoy_change_pct": "20.00",
+                    "is_complete_month": True,
+                }
+            ],
+            "seasonality": [
+                {
+                    "calendar_month": "January",
+                    "average_net_line_value": "900.00",
+                    "seasonal_index_pct": "100.00",
+                    "months_observed": 2,
+                }
+            ],
+            "anomaly_analysis": {
+                "status": "evaluated",
+                "method": "modified_z_score_mad",
+                "months_evaluated": 12,
+                "anomalies": [],
+                "note": "No outliers detected.",
+            },
+            "limitations": [],
+        }
 
     async def fred_observations(
         series_id: str,
@@ -88,6 +125,7 @@ def build_mock_tools(news_responses=None, news_queries=None):
         ("analytics__get_dataset_overview", dataset_overview),
         ("analytics__get_sales_summary", sales_summary),
         ("analytics__get_top_products", top_products),
+        ("analytics__get_monthly_sales_analysis", monthly_sales_analysis),
         ("research__get_fred_series_observations", fred_observations),
         ("research__search_market_news", market_news),
     ]
@@ -100,6 +138,7 @@ def build_mock_tools(news_responses=None, news_queries=None):
         )
         for name, function in definitions
     ], calls_started
+
 
 def make_gnews_response(
     *,
@@ -143,10 +182,7 @@ async def test_internal_research_graph_execution():
 
     print(
         "EVIDENCE BY PROVIDER:",
-        Counter(
-            item.get("provider")
-            for item in result.get("external_evidence", [])
-        ),
+        Counter(item.get("provider") for item in result.get("external_evidence", [])),
     )
 
     print(
@@ -159,7 +195,7 @@ async def test_internal_research_graph_execution():
     )
 
     # Both internal analytics tools must execute concurrently.
-    assert calls_started == {"sales", "products"}
+    assert calls_started == {"sales", "products", "monthly"}
 
     # Retrieval results.
     assert result["retrieval_mode"] == "internal_only"
@@ -177,6 +213,12 @@ async def test_internal_research_graph_execution():
     assert "900.00" in result["report"]
     assert result["errors"] == []
 
+    assert result["internal_data"]["monthly_sales_analysis"]["monthly_trend"]
+    assert "Monthly sales trends" in result["report"]
+    assert "Seasonal sales patterns" in result["report"]
+    assert "10.00%" in result["report"]
+
+
 async def test_crag_retries_and_accepts_corrected_evidence():
     news_queries = []
 
@@ -190,8 +232,7 @@ async def test_crag_retries_and_accepts_corrected_evidence():
             make_gnews_response(
                 title="Retail purchasing patterns shift across stores",
                 description=(
-                    "Retail purchasing patterns reveal changing "
-                    "consumer buying behavior."
+                    "Retail purchasing patterns reveal changing consumer buying behavior."
                 ),
                 url="https://example.com/retail-1",
             ),
@@ -211,7 +252,7 @@ async def test_crag_retries_and_accepts_corrected_evidence():
     )
 
     # Internal retrieval remains operational.
-    assert calls_started == {"sales", "products"}
+    assert calls_started == {"sales", "products", "monthly"}
     assert result["internal_data"]["sales_summary"]["net_line_value"] == "900.00"
 
     # Initial retrieval plus exactly one corrective retrieval.

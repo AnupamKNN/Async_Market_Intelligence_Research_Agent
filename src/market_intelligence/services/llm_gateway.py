@@ -1,7 +1,10 @@
-"""Centralized LangChain LLM gateway through Portkey."""
+"""Centralized provider-specific LangChain LLM gateway."""
 
 from typing import Literal
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_groq import ChatGroq
+from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 from market_intelligence.core.config import Settings
@@ -16,16 +19,26 @@ def create_chat_model(
     model: str,
     temperature: float = 0.0,
     max_completion_tokens: int | None = None,
-) -> ChatOpenAI:
-    """Create a LangChain chat model routed through Portkey."""
+) -> BaseChatModel:
+    """Create a provider-specific LangChain chat model."""
 
-    headers = {"x-portkey-provider": provider}
+    if max_completion_tokens is not None and max_completion_tokens < 1:
+        raise ValueError("max_completion_tokens must be positive.")
 
+    if temperature < 0:
+        raise ValueError("temperature cannot be negative.")
+
+    # Ollama: direct local connection.
     if provider == "ollama":
-        api_key = "ollama"
-        headers["x-portkey-custom-host"] = settings.ollama_base_url.rstrip("/")
+        return ChatOllama(
+            model=model,
+            base_url=settings.ollama_base_url.rstrip("/"),
+            temperature=temperature,
+            num_predict=max_completion_tokens,
+        )
 
-    elif provider == "groq":
+    # Groq: direct Groq API connection.
+    if provider == "groq":
         if settings.groq_api_key is None:
             raise ValueError("GROQ_API_KEY is not configured.")
 
@@ -34,7 +47,15 @@ def create_chat_model(
         if not api_key.strip():
             raise ValueError("GROQ_API_KEY is empty.")
 
-    elif provider == "openai":
+        return ChatGroq(
+            model=model,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_completion_tokens,
+        )
+
+    # OpenAI: direct OpenAI API connection.
+    if provider == "openai":
         if settings.openai_api_key is None:
             raise ValueError("OPENAI_API_KEY is not configured.")
 
@@ -43,17 +64,11 @@ def create_chat_model(
         if not api_key.strip():
             raise ValueError("OPENAI_API_KEY is empty.")
 
-    else:
-        raise ValueError(f"Unsupported LLM provider: {provider}")
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_completion_tokens,
+        )
 
-    if max_completion_tokens is not None and max_completion_tokens < 1:
-        raise ValueError("max_completion_tokens must be positive.")
-
-    return ChatOpenAI(
-        model=model,
-        base_url=settings.portkey_base_url,
-        api_key=api_key,
-        temperature=temperature,
-        default_headers=headers,
-        max_completion_tokens=max_completion_tokens,
-    )
+    raise ValueError(f"Unsupported LLM provider: {provider}")

@@ -39,6 +39,7 @@ REQUIRED_TOOLS = {
     "analytics__get_top_products",
     "research__get_fred_series_observations",
     "research__search_market_news",
+    "analytics__get_monthly_sales_analysis",
 }
 
 
@@ -536,6 +537,10 @@ def build_research_graph(
                     **date_arguments,
                 },
             ),
+            "monthly_sales_analysis": (
+                tool_map["analytics__get_monthly_sales_analysis"],
+                date_arguments,
+            ),
         }
 
         async def call_one(
@@ -617,16 +622,12 @@ def build_research_graph(
 
             return _parse_tool_output(raw)
 
-        historical_series_ids = state.get(
-            "planned_historical_fred_series"
-        )
+        historical_series_ids = state.get("planned_historical_fred_series")
 
         if historical_series_ids is None:
             historical_series_ids = state.get("planned_fred_series", [])
 
-        current_series_ids = state.get(
-            "planned_current_fred_series", []
-        )
+        current_series_ids = state.get("planned_current_fred_series", [])
 
         # Historical observations: align with the dataset window.
         if historical_series_ids:
@@ -807,14 +808,12 @@ def build_research_graph(
         if decision["should_retry"]:
             next_attempt = state.get("crag_attempts", 0) + 1
 
-            updates["crag_corrected_news_query"] = (
-                build_corrective_news_query(
-                    question=state.get("question", ""),
-                    original_query=state.get("planned_news_query"),
-                    target_geography=state.get("target_geography"),
-                    attempt=next_attempt,
-                    reason=decision["reason"],
-                )
+            updates["crag_corrected_news_query"] = build_corrective_news_query(
+                question=state.get("question", ""),
+                original_query=state.get("planned_news_query"),
+                target_geography=state.get("target_geography"),
+                attempt=next_attempt,
+                reason=decision["reason"],
             )
 
         return updates
@@ -843,9 +842,7 @@ def build_research_graph(
             return {
                 "crag_attempts": attempt,
                 "crag_status": "retry_failed",
-                "errors": [
-                    "CRAG corrective retrieval skipped: corrected query is empty."
-                ],
+                "errors": ["CRAG corrective retrieval skipped: corrected query is empty."],
             }
 
         try:
@@ -859,49 +856,34 @@ def build_research_graph(
                 "sort_by": "publishedAt",
             }
 
-            raw = await tool_map[
-                "research__search_market_news"
-            ].ainvoke(arguments)
+            raw = await tool_map["research__search_market_news"].ainvoke(arguments)
 
             parsed = _parse_tool_output(raw)
             bundle = normalize_gnews_response(parsed)
 
             new_bundle = bundle.model_dump(mode="json")
-            new_evidence = [
-                item.model_dump(mode="json")
-                for item in bundle.items
-            ]
+            new_evidence = [item.model_dump(mode="json") for item in bundle.items]
 
             # Preserve original evidence and append only new evidence.
             merged_bundles = list(state.get("external_bundles", []))
             existing_bundle_ids = {
-                item.get("bundle_id")
-                for item in merged_bundles
-                if item.get("bundle_id")
+                item.get("bundle_id") for item in merged_bundles if item.get("bundle_id")
             }
 
             new_bundle_id = new_bundle.get("bundle_id")
 
-            if (
-                not new_bundle_id
-                or new_bundle_id not in existing_bundle_ids
-            ):
+            if not new_bundle_id or new_bundle_id not in existing_bundle_ids:
                 merged_bundles.append(new_bundle)
 
             merged_evidence = list(state.get("external_evidence", []))
             existing_evidence_ids = {
-                item.get("evidence_id")
-                for item in merged_evidence
-                if item.get("evidence_id")
+                item.get("evidence_id") for item in merged_evidence if item.get("evidence_id")
             }
 
             for item in new_evidence:
                 evidence_id = item.get("evidence_id")
 
-                if (
-                    not evidence_id
-                    or evidence_id not in existing_evidence_ids
-                ):
+                if not evidence_id or evidence_id not in existing_evidence_ids:
                     merged_evidence.append(item)
 
                     if evidence_id:
@@ -919,10 +901,7 @@ def build_research_graph(
                 "crag_attempts": attempt,
                 "crag_status": "retry_failed",
                 "errors": [
-                    (
-                        "CRAG corrective retrieval failed: "
-                        f"{type(exc).__name__}: {str(exc)[:300]}"
-                    )
+                    (f"CRAG corrective retrieval failed: {type(exc).__name__}: {str(exc)[:300]}")
                 ],
             }
 
@@ -1013,17 +992,126 @@ def build_research_graph(
                     "",
                     "### Top products by net line value",
                     "",
-                    "| Stock code | Product | Net line value |",
-                    "|---|---|---:|",
+                    "| Stock code | Product | Net line value | Positive sales contribution |"
+                    "|---|---|---:|---:|",
                 ]
             )
 
             for product in products:
                 description = product.get("description") or "Description unavailable"
                 description = description.replace("|", "\\|")
+                share = product.get("positive_line_value_share_pct")
+
                 sections.append(
-                    f"| {product['stock_code']} | {description} | {product['net_line_value']} |"
+                    f"| {product['stock_code']} | {description} "
+                    f"| {product['net_line_value']} "
+                    f"| {f'{share}%' if share is not None else 'N/A'} |"
                 )
+
+                monthly = internal.get("monthly_sales_analysis", {})
+
+        if monthly:
+            trend = monthly.get("monthly_trend", [])
+
+            if trend:
+                sections.extend(
+                    [
+                        "",
+                        "### Monthly sales trends",
+                        "",
+                        "| Month | Net line value | MoM change | YoY change | Completeness |",
+                        "|---|---:|---:|---:|---|",
+                    ]
+                )
+
+                for item in trend:
+                    mom = (
+                        f"{item['mom_change_pct']}%"
+                        if item.get("mom_change_pct") is not None
+                        else "N/A"
+                    )
+                    yoy = (
+                        f"{item['yoy_change_pct']}%"
+                        if item.get("yoy_change_pct") is not None
+                        else "N/A"
+                    )
+                    completeness = "Complete" if item["is_complete_month"] else "Partial"
+
+                    sections.append(
+                        f"| {item['month_label']} "
+                        f"| {item['net_line_value']} "
+                        f"| {mom} | {yoy} | {completeness} |"
+                    )
+
+            seasonality = monthly.get("seasonality", [])
+
+            if seasonality:
+                sections.extend(
+                    [
+                        "",
+                        "### Seasonal sales patterns",
+                        "",
+                        "| Calendar month | Average net line value | Seasonal index | Observations |",
+                        "|---|---:|---:|---:|",
+                    ]
+                )
+
+                for item in seasonality:
+                    index = (
+                        f"{item['seasonal_index_pct']}%"
+                        if item.get("seasonal_index_pct") is not None
+                        else "N/A"
+                    )
+
+                    sections.append(
+                        f"| {item['calendar_month']} "
+                        f"| {item['average_net_line_value']} "
+                        f"| {index} "
+                        f"| {item['months_observed']} |"
+                    )
+
+            anomaly = monthly.get("anomaly_analysis", {})
+            anomalies = anomaly.get("anomalies", [])
+
+            sections.extend(
+                [
+                    "",
+                    "### Monthly sales anomaly detection",
+                    "",
+                    f"- Method: {anomaly.get('method') or 'Not evaluated'}",
+                    f"- Months evaluated: {anomaly.get('months_evaluated', 0)}",
+                ]
+            )
+
+            if anomalies:
+                sections.extend(
+                    [
+                        "",
+                        "| Month | Net line value | Direction | Modified Z-score |",
+                        "|---|---:|---|---:|",
+                    ]
+                )
+
+                for item in anomalies:
+                    score = (
+                        item["modified_z_score"]
+                        if item.get("modified_z_score") is not None
+                        else "IQR threshold"
+                    )
+
+                    sections.append(
+                        f"| {item['month_label']} "
+                        f"| {item['net_line_value']} "
+                        f"| {item['direction']} | {score} |"
+                    )
+            else:
+                sections.append(
+                    "- No monthly outliers were flagged, or there was "
+                    "insufficient history to evaluate them."
+                )
+
+            for limitation in monthly.get("limitations", []):
+                sections.append(f"- Limitation: {limitation}")
 
         if not internal:
             sections.append("No internal analytics were requested or retrieved.")

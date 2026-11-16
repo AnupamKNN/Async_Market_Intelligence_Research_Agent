@@ -36,8 +36,7 @@ def assess_crag_quality(
         isinstance(item, Mapping)
         and item.get("citation_valid")
         and (item.get("topical_relevance") or {}).get("status") == "matched"
-        and (item.get("geographic_relevance") or {}).get("status")
-        in {"matched", "not_requested"}
+        and (item.get("geographic_relevance") or {}).get("status") in {"matched", "not_requested"}
         for item in assessments
     )
 
@@ -111,6 +110,6 @@ def build_corrective_news_query(
     if base and fixed_text:
         available_base_length -= 1
 
-    base = base[:max(0, available_base_length)].strip()
+    base = base[: max(0, available_base_length)].strip()
 
     return " ".join(part for part in (base, fixed_text) if part)[:200]

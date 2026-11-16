@@ -5,11 +5,11 @@ import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
 
 from market_intelligence.core.config import Settings
 from market_intelligence.orchestration.state import ResearchState
 from market_intelligence.schemas.analyst import AnalystFindings
+from market_intelligence.services.llm_gateway import create_chat_model
 
 ANALYST_SYSTEM_PROMPT = """
 You are the qualitative analyst of a market intelligence platform.
@@ -42,9 +42,13 @@ STRICT RULES:
 13. Recommendations must be actionable and supported by the evidence.
 14. Do not invent or modify supporting field paths.
 15. Do not reproduce individual product names or identifiers.
-    Refer to the retrieved product ranking. The deterministic report
-    contains the authoritative product names and values.
-
+    The deterministic report contains the authoritative product names,
+    rankings and values.
+    Never use placeholders such as "[product rankings]",
+    "[insert results]", or other bracketed template text.
+    For a product-ranking objective, state that the ranked products
+    and their values are presented in the deterministic top-products
+    table of the report.
 NARRATIVE RESTRICTIONS:
 
 - Executive summary, findings, business implications, limitations,
@@ -152,15 +156,24 @@ def _collect_field_paths(
 def create_analyst_node(settings: Settings):
     """Build the asynchronous qualitative analyst node."""
 
-    model = ChatOllama(
-        model="qwen2.5:7b",
+    # model = ChatOllama(
+    #     model="qwen2.5:7b",
+    #     temperature=0.0,
+    #     num_predict=4096,
+    # )
+
+    model = create_chat_model(
+        settings,
+        provider=settings.supervisor_llm_provider,
+        model=settings.supervisor_llm_model,
         temperature=0.0,
-        num_predict=4096,
+        max_completion_tokens=4096,
     )
 
     structured_model = model.with_structured_output(
         AnalystFindings,
         method="json_schema",
+        strict=True,
     )
 
     async def analyst_node(state: ResearchState) -> dict[str, Any]:
@@ -246,7 +259,7 @@ def create_analyst_node(settings: Settings):
                 "excerpt": record.get("excerpt") or "",
                 "data": record.get("data", {}),
             }
-            for record in raw_external[:40]
+            for record in raw_external
         ]
 
         evidence_index = {
@@ -396,7 +409,15 @@ def create_analyst_node(settings: Settings):
             ),
         ]
 
-        response = await structured_model.ainvoke(messages)
+        raw_response = await structured_model.ainvoke(messages)
+
+        response_payload = raw_response.model_dump(mode="python")
+
+        # Supporting fields are resolved deterministically by Python.
+        for finding in response_payload.get("findings", []):
+            finding.setdefault("supporting_fields", [])
+
+        response = AnalystFindings.model_validate(response_payload)
 
         candidate = (
             response

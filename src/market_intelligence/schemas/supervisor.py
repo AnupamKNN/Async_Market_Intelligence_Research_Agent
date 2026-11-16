@@ -55,14 +55,14 @@ class SupervisorPlan(BaseModel):
     )
 
     rationale: str = Field(
-    default="",
-    description="Brief explanation of the selected research strategy.",
+        default="",
+        description="Brief explanation of the selected research strategy.",
     )
 
     @model_validator(mode="after")
     def validate_retrieval_plan(self):
         """Ensure that the selected sources have valid retrieval targets."""
-        
+
         if not self.sources:
             return self
 

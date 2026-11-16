@@ -75,3 +75,27 @@ class AnalystFindings(BaseModel):
     )
 
     confidence: Literal["high", "medium", "low"]
+
+
+class AnalystStructuredFinding(BaseModel):
+    """Groq-compatible structured finding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str
+    status: Literal["supported", "partially_supported", "unsupported"]
+    finding: str
+    business_implication: str
+    limitation: str | None
+
+
+class AnalystStructuredOutput(BaseModel):
+    """Strict LLM response schema, validated again by AnalystFindings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    executive_summary: str
+    findings: list[AnalystStructuredFinding]
+    recommendations: list[str]
+    limitations: list[str]
+    confidence: Literal["high", "medium", "low"]

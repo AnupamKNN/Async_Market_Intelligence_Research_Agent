@@ -135,3 +135,34 @@ class Settings(BaseSettings):
         le=2.0,
         validation_alias="SUPERVISOR_LLM_TEMPERATURE",
     )
+
+    collector_llm_provider: Literal["ollama", "groq", "openai"] = Field(
+        default="groq",
+        validation_alias="COLLECTOR_LLM_PROVIDER",
+    )
+
+    collector_llm_model: str = Field(
+        default="openai/gpt-oss-20b",
+        validation_alias="COLLECTOR_LLM_MODEL",
+    )
+
+    # Authentication
+    auth_session_ttl_hours: int = Field(
+        default=168,
+        ge=1,
+        le=720,
+        validation_alias="AUTH_SESSION_TTL_HOURS",
+    )
+
+    auth_cookie_secure: bool = Field(
+        default=False,
+        validation_alias="AUTH_COOKIE_SECURE",
+    )
+
+    frontend_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
+        validation_alias="FRONTEND_ORIGINS",
+    )

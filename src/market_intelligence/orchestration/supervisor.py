@@ -101,12 +101,12 @@ def create_supervisor_node(settings: Settings):
         }
 
         response = await structured_model.ainvoke(
-    [
-        SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
-        HumanMessage(
-            content=f"Create the research execution plan for this request:\n{context}"
-        ),
-    ]
+            [
+                SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=f"Create the research execution plan for this request:\n{context}"
+                ),
+            ]
         )
 
         plan = (
@@ -144,45 +144,45 @@ def create_supervisor_node(settings: Settings):
         include_external = "external" in resolved_sources
 
         if include_external and not (planned_fred_series or planned_news_query):
-            raise ValueError(
-                "External research requires at least one retrieval target."
-            )
+            raise ValueError("External research requires at least one retrieval target.")
 
         if not include_external:
             planned_fred_series = []
             planned_news_query = None
-        
-        scope_text = " ".join(
-            [question, *plan.analysis_objectives]
-        ).casefold()
+
+        scope_text = " ".join([question, *plan.analysis_objectives]).casefold()
 
         current_terms = (
-            "current", "currently", "recent",
-            "latest", "today", "present",
+            "current",
+            "currently",
+            "recent",
+            "latest",
+            "today",
+            "present",
         )
 
         historical_terms = (
-            "historical", "history", "dataset",
-            "historic", "2009", "2010", "2011",
+            "historical",
+            "history",
+            "dataset",
+            "historic",
+            "2009",
+            "2010",
+            "2011",
         )
 
         wants_current = any(term in scope_text for term in current_terms)
-        wants_historical = (
-            any(term in scope_text for term in historical_terms)
-            or bool(state.get("start_date") or state.get("end_date"))
+        wants_historical = any(term in scope_text for term in historical_terms) or bool(
+            state.get("start_date") or state.get("end_date")
         )
 
         # Default to historical retrieval when no temporal scope is explicit.
         if not wants_current and not wants_historical:
             wants_historical = True
 
-        planned_historical_fred_series = (
-            planned_fred_series if wants_historical else []
-        )
+        planned_historical_fred_series = planned_fred_series if wants_historical else []
 
-        planned_current_fred_series = (
-            planned_fred_series if wants_current else []
-        )
+        planned_current_fred_series = planned_fred_series if wants_current else []
 
         # Supply a deterministic rationale if the LLM omitted it.
         rationale = plan.rationale.strip()[:500] or (
@@ -196,14 +196,12 @@ def create_supervisor_node(settings: Settings):
         if not objectives:
             if include_internal:
                 objectives.append(
-                    "Analyze internal retail transactions, sales performance, "
-                    "and product activity."
+                    "Analyze internal retail transactions, sales performance, and product activity."
                 )
 
             if include_external:
                 objectives.append(
-                    "Assess relevant external economic indicators and "
-                    "current retail market news."
+                    "Assess relevant external economic indicators and current retail market news."
                 )
 
         # Validate the completed execution plan.
@@ -245,5 +243,5 @@ def create_supervisor_node(settings: Settings):
             "planned_news_query": planned_news_query,
             "supervisor_decision": decision,
         }
-    
+
     return supervisor_node
