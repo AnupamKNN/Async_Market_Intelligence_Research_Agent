@@ -114,8 +114,6 @@ async def submit_research(
                 "job_id": str(job_id),
                 "payload": json.dumps(job_payload, ensure_ascii=False),
             },
-            maxlen=10_000,
-            approximate=True,
         )
 
     except Exception as exc:
