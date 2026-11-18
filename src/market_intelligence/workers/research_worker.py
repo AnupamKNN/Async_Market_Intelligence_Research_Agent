@@ -24,6 +24,9 @@ from market_intelligence.db.repositories.research_jobs import (
 )
 from market_intelligence.mcp.langchain_bridge import MCPToolBridge
 from market_intelligence.orchestration.graph import build_research_graph
+from market_intelligence.services.research_outbox_publisher import (
+    run_outbox_publisher,
+)
 from market_intelligence.services.research_queue import (
     MAX_MALFORMED_DELIVERIES,
     QUEUE_GROUP,
@@ -587,10 +590,13 @@ async def process_research_job(
 
 
 async def run_worker() -> None:
+    """Start the research consumer and transactional outbox publisher."""
+
     settings = Settings()
 
     redis = create_redis_client(settings)
     pool = None
+    publisher_task: asyncio.Task | None = None
 
     consumer = f"{socket.gethostname()}-{uuid4().hex[:8]}"
 
@@ -599,6 +605,7 @@ async def run_worker() -> None:
 
         pool = await create_database_pool(settings)
 
+        # Initialize research jobs, lease migrations and outbox storage.
         await initialize_research_jobs(pool)
 
         # Initialize the Redis consumer group.
@@ -618,9 +625,15 @@ async def run_worker() -> None:
             consumer,
         )
 
+        # Run the outbox publisher independently from the research consumer.
+        # Both tasks share the same Redis client and PostgreSQL pool.
+        publisher_task = asyncio.create_task(
+            run_outbox_publisher(redis, pool),
+            name="research-outbox-publisher",
+        )
+
         while True:
-            # Redis pending-message reclamation is coordinated with
-            # the database lease duration.
+            # Recover abandoned Redis pending messages.
             claimed = await redis.xautoclaim(
                 QUEUE_STREAM,
                 QUEUE_GROUP,
@@ -653,7 +666,12 @@ async def run_worker() -> None:
                         if not isinstance(payload, dict):
                             raise ValueError("Research job payload must be a JSON object.")
 
-                    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    except (
+                        KeyError,
+                        ValueError,
+                        TypeError,
+                        json.JSONDecodeError,
+                    ) as exc:
                         logger.exception(
                             "Malformed research queue message %s.",
                             message_id,
@@ -687,7 +705,8 @@ async def run_worker() -> None:
 
                             if not acknowledged:
                                 logger.warning(
-                                    "Queue message %s was already acknowledged or is no longer pending.",
+                                    "Queue message %s was already acknowledged "
+                                    "or is no longer pending.",
                                     message_id,
                                 )
 
@@ -696,9 +715,18 @@ async def run_worker() -> None:
                             "Unexpected worker error for queue message %s.",
                             message_id,
                         )
-                        # Leave the message pending for later recovery.
+                        # Leave the message pending for recovery.
 
     finally:
+        # Stop the publisher before closing its shared dependencies.
+        if publisher_task is not None:
+            publisher_task.cancel()
+
+            await asyncio.gather(
+                publisher_task,
+                return_exceptions=True,
+            )
+
         if pool is not None:
             await pool.close()
 

@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -17,7 +18,6 @@ from market_intelligence.db.repositories.conversations import (
 )
 from market_intelligence.db.repositories.research_jobs import (
     create_research_job,
-    fail_research_job,
     get_research_job_for_user,
 )
 from market_intelligence.schemas.research import (
@@ -25,11 +25,7 @@ from market_intelligence.schemas.research import (
     ResearchJobResponse,
     ResearchRequest,
 )
-from market_intelligence.services.research_queue import (
-    QUEUE_STREAM,
-    event_stream_key,
-    publish_job_event,
-)
+from market_intelligence.services.research_queue import event_stream_key
 
 router = APIRouter(prefix="/research", tags=["Research"])
 
@@ -52,7 +48,6 @@ async def submit_research(
     validate_csrf(request, session)
 
     pool = request.app.state.db_pool
-    redis = request.app.state.redis
 
     job_id = uuid4()
     user_id = session["user_id"]
@@ -107,33 +102,33 @@ async def submit_research(
         conversation_id=conversation_id,
     )
 
-    try:
-        await redis.xadd(
-            QUEUE_STREAM,
-            {
-                "job_id": str(job_id),
-                "payload": json.dumps(job_payload, ensure_ascii=False),
-            },
-        )
+    # try:
+    #     await redis.xadd(
+    #         QUEUE_STREAM,
+    #         {
+    #             "job_id": str(job_id),
+    #             "payload": json.dumps(job_payload, ensure_ascii=False),
+    #         },
+    #     )
 
-    except Exception as exc:
-        await fail_research_job(
-            pool,
-            job_id,
-            "Unable to enqueue research job.",
-        )
+    # except Exception as exc:
+    #     await fail_research_job(
+    #         pool,
+    #         job_id,
+    #         "Unable to enqueue research job.",
+    #     )
 
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unable to enqueue the research job.",
-        ) from exc
+    #     raise HTTPException(
+    #         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    #         detail="Unable to enqueue the research job.",
+    #     ) from exc
 
-    await publish_job_event(
-        redis,
-        job_id,
-        "queued",
-        {"message": "Research job accepted."},
-    )
+    # await publish_job_event(
+    #     redis,
+    #     job_id,
+    #     "queued",
+    #     {"message": "Research job accepted."},
+    # )
 
     return ResearchJobAccepted(
         job_id=job_id,
@@ -182,7 +177,7 @@ async def stream_research_events(
         Depends(get_authenticated_session),
     ],
 ) -> StreamingResponse:
-    """Stream events only to the owner of the research job."""
+    """Stream research events with cursor-based recovery."""
 
     pool = request.app.state.db_pool
     user_id = session["user_id"]
@@ -199,11 +194,21 @@ async def stream_research_events(
             detail="Research job not found.",
         )
 
+    # Native EventSource automatically supplies this header when
+    # reconnecting after receiving an event containing an SSE id.
+    last_event_id = request.headers.get("last-event-id", "").strip()
+
+    if last_event_id and not re.fullmatch(r"\d+-\d+", last_event_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Last-Event-ID header.",
+        )
+
     redis = request.app.state.redis
 
     async def event_generator():
         stream = event_stream_key(job_id)
-        last_id = "0-0"
+        last_id = last_event_id or "0-0"
 
         while True:
             if await request.is_disconnected():
@@ -215,36 +220,64 @@ async def stream_research_events(
                 block=10_000,
             )
 
-            if not records:
-                current = await get_research_job_for_user(
-                    pool,
-                    job_id,
-                    user_id,
-                )
+            if records:
+                for _, messages in records:
+                    for message_id, fields in messages:
+                        last_id = message_id
 
-                if current and current["status"] in {"completed", "failed"}:
-                    break
+                        event_name = fields.get("event", "progress")
+                        data = fields.get("data", "{}")
 
-                yield ": keep-alive\n\n"
+                        yield (f"id: {message_id}\nevent: {event_name}\ndata: {data}\n\n")
+
+                        if event_name in {"completed", "failed"}:
+                            return
+
                 continue
 
-            for _, messages in records:
-                for message_id, fields in messages:
-                    last_id = message_id
+            # Redis has no new events. Check PostgreSQL because it
+            # is authoritative for the job's current status.
+            current = await get_research_job_for_user(
+                pool,
+                job_id,
+                user_id,
+            )
 
-                    event_name = fields.get("event", "progress")
-                    data = fields.get("data", "{}")
+            if current is None:
+                return
 
-                    yield (f"id: {message_id}\nevent: {event_name}\ndata: {data}\n\n")
+            current_status = current["status"]
 
-                    if event_name in {"completed", "failed"}:
-                        return
+            if current_status in {"completed", "failed"}:
+                if current_status == "completed":
+                    message = "Research completed. Final state recovered from PostgreSQL."
+                else:
+                    message = (
+                        current.get("error")
+                        or "Research failed. Final state recovered from PostgreSQL."
+                    )
+
+                recovery_data = {
+                    "message": message,
+                    "status": current_status,
+                    "recovered": True,
+                }
+
+                yield (
+                    f"event: {current_status}\n"
+                    f"data: {json.dumps(recovery_data, ensure_ascii=False)}\n\n"
+                )
+
+                return
+
+            # The job is still active. Keep the connection open.
+            yield ": keep-alive\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },

@@ -1,3 +1,4 @@
+import json
 from uuid import uuid4
 
 import pytest
@@ -7,6 +8,7 @@ from market_intelligence.api.app import app
 from market_intelligence.api.v1.dependencies import get_authenticated_session
 from market_intelligence.api.v1.endpoints import research as research_endpoint
 from market_intelligence.services.auth_security import generate_token, hash_token
+from market_intelligence.services.research_queue import event_stream_key
 
 
 @pytest.fixture(scope="module")
@@ -63,13 +65,6 @@ def test_authenticated_user_can_submit_research(
         created["user_id"] = owner_id
         created["job_conversation_id"] = conversation_id
 
-    async def fake_publish_job_event(redis, job_id, event, data):
-        return None
-
-    class FakeRedis:
-        async def xadd(self, *args, **kwargs):
-            return "1-0"
-
     monkeypatch.setattr(
         research_endpoint,
         "create_research_conversation",
@@ -80,12 +75,6 @@ def test_authenticated_user_can_submit_research(
         "create_research_job",
         fake_create_research_job,
     )
-    monkeypatch.setattr(
-        research_endpoint,
-        "publish_job_event",
-        fake_publish_job_event,
-    )
-    monkeypatch.setattr(app.state, "redis", FakeRedis())
 
     client.cookies.set("mi_csrf", csrf_token)
 
@@ -107,3 +96,168 @@ def test_authenticated_user_can_submit_research(
     assert str(created["job_id"]) == response_data["job_id"]
     assert str(created["conversation_id"]) == response_data["conversation_id"]
     assert created["title"] == "Summarize sales trends."
+
+
+def test_sse_resumes_after_last_event_id_and_recovers_completion(
+    client: TestClient,
+    authenticated_session,
+    monkeypatch,
+):
+    """Replay events after the browser cursor and recover terminal state."""
+
+    user_id, _ = authenticated_session
+    job_id = uuid4()
+    stream = event_stream_key(job_id)
+
+    cursor = "1700000000000-0"
+    next_event_id = "1700000001000-0"
+
+    job = {
+        "job_id": job_id,
+        "status": "completed",
+        "result": {"report": "Persisted research report."},
+        "error": None,
+    }
+
+    xread_cursors = []
+
+    async def fake_get_job(pool, requested_job_id, owner_id):
+        assert requested_job_id == job_id
+        assert owner_id == user_id
+        return job
+
+    class FakeRedis:
+        async def xread(self, streams, count, block):
+            xread_cursors.append(streams[stream])
+
+            if len(xread_cursors) == 1:
+                return [
+                    (
+                        stream,
+                        [
+                            (
+                                next_event_id,
+                                {
+                                    "event": "progress",
+                                    "data": json.dumps(
+                                        {
+                                            "stage": "analysis",
+                                            "message": "Analysis completed.",
+                                        }
+                                    ),
+                                },
+                            )
+                        ],
+                    )
+                ]
+
+            return []
+
+    monkeypatch.setattr(
+        research_endpoint,
+        "get_research_job_for_user",
+        fake_get_job,
+    )
+    monkeypatch.setattr(
+        app.state,
+        "redis",
+        FakeRedis(),
+        raising=False,
+    )
+
+    response = client.get(
+        f"/api/v1/research/jobs/{job_id}/events",
+        headers={"Last-Event-ID": cursor},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    assert xread_cursors == [
+        cursor,
+        next_event_id,
+    ]
+
+    assert "event: progress" in response.text
+    assert "event: completed" in response.text
+    assert '"recovered": true' in response.text
+
+
+def test_sse_recovers_failed_job_when_redis_has_no_events(
+    client: TestClient,
+    authenticated_session,
+    monkeypatch,
+):
+    """A failed PostgreSQL job must emit a terminal SSE event."""
+
+    user_id, _ = authenticated_session
+    job_id = uuid4()
+
+    async def fake_get_job(pool, requested_job_id, owner_id):
+        assert requested_job_id == job_id
+        assert owner_id == user_id
+
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "result": None,
+            "error": "Provider unavailable.",
+        }
+
+    class FakeRedis:
+        async def xread(self, streams, count, block):
+            return []
+
+    monkeypatch.setattr(
+        research_endpoint,
+        "get_research_job_for_user",
+        fake_get_job,
+    )
+    monkeypatch.setattr(
+        app.state,
+        "redis",
+        FakeRedis(),
+        raising=False,
+    )
+
+    response = client.get(
+        f"/api/v1/research/jobs/{job_id}/events",
+    )
+
+    assert response.status_code == 200
+    assert "event: failed" in response.text
+    assert "Provider unavailable." in response.text
+    assert '"recovered": true' in response.text
+
+
+def test_sse_rejects_invalid_last_event_id(
+    client: TestClient,
+    authenticated_session,
+    monkeypatch,
+):
+    """An invalid Redis stream cursor must be rejected."""
+
+    user_id, _ = authenticated_session
+    job_id = uuid4()
+
+    async def fake_get_job(pool, requested_job_id, owner_id):
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "result": None,
+            "error": None,
+        }
+
+    monkeypatch.setattr(
+        research_endpoint,
+        "get_research_job_for_user",
+        fake_get_job,
+    )
+
+    response = client.get(
+        f"/api/v1/research/jobs/{job_id}/events",
+        headers={"Last-Event-ID": "invalid-cursor"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Last-Event-ID header."

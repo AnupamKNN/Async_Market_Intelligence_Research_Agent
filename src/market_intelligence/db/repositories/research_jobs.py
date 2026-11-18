@@ -4,6 +4,11 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
+from market_intelligence.db.repositories.research_outbox import (
+    initialize_research_outbox,
+    insert_research_outbox_record,
+)
+
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_DURATION_SECONDS = 120
 
@@ -76,6 +81,7 @@ async def initialize_research_jobs(pool: asyncpg.Pool) -> None:
 
     await pool.execute(CREATE_RESEARCH_JOBS_TABLE)
     await pool.execute(MIGRATE_RESEARCH_JOBS_LEASES)
+    await initialize_research_outbox(pool)
 
 
 async def create_research_job(
@@ -85,28 +91,41 @@ async def create_research_job(
     user_id: UUID,
     conversation_id: UUID | None = None,
 ) -> None:
-    """Persist a newly submitted research job."""
+    """
+    Atomically persist a research job and its Redis publication intent.
 
-    await pool.execute(
-        """
-        INSERT INTO research_jobs (
-            id,
-            user_id,
-            conversation_id,
-            question,
-            request_payload,
-            status,
-            max_attempts
-        )
-        VALUES ($1, $2, $3, $4, $5::jsonb, 'queued', $6)
-        """,
-        job_id,
-        user_id,
-        conversation_id,
-        payload["question"],
-        json.dumps(payload),
-        DEFAULT_MAX_ATTEMPTS,
-    )
+    The outbox record is committed only if the research job insert succeeds,
+    and vice versa.
+    """
+
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            await connection.execute(
+                """
+                INSERT INTO research_jobs (
+                    id,
+                    user_id,
+                    conversation_id,
+                    question,
+                    request_payload,
+                    status,
+                    max_attempts
+                )
+                VALUES ($1, $2, $3, $4, $5::jsonb, 'queued', $6)
+                """,
+                job_id,
+                user_id,
+                conversation_id,
+                payload["question"],
+                json.dumps(payload, ensure_ascii=False, default=str),
+                DEFAULT_MAX_ATTEMPTS,
+            )
+
+            await insert_research_outbox_record(
+                connection,
+                job_id,
+                payload,
+            )
 
 
 async def mark_job_running(
