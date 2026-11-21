@@ -20,19 +20,63 @@ export interface ResearchJobAccepted {
   events_url: string;
 }
 
+export interface ResearchJobCancellationResponse {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  cancellation_requested: boolean;
+}
+
+export interface ResearchJobCancellationResponse {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  cancellation_requested: boolean;
+}
+
+export interface ChartDataPoint {
+  x: string;
+  y: number | null;
+  metadata: Record<
+    string,
+    string | number | boolean | null
+  >;
+}
+
+export interface ChartSeries {
+  name: string;
+  render_as: "line" | "bar" | "scatter" | null;
+  data: ChartDataPoint[];
+}
+
+export interface ResearchChart {
+  id: string;
+  title: string;
+  description: string | null;
+  chart_type: "line" | "bar";
+  x_axis_title: string;
+  y_axis_title: string;
+  series: ChartSeries[];
+}
+
+export interface ResearchVisualizations {
+  schema_version: 1;
+  charts: ResearchChart[];
+  warnings: string[];
+}
+
 export interface ResearchJobResult {
   report?: string;
   analyst_findings?: unknown;
   collector_findings?: unknown;
   evidence_grade?: unknown;
   quantitative_analysis?: unknown;
+  visualizations?: ResearchVisualizations | null;
   errors?: string[];
 }
 
 export interface ResearchJobResponse {
   job_id: string;
   question: string;
-  status: "queued" | "running" | "completed" | "failed";
+  status: | "queued" | "running" | "completed" | "failed" | "cancelled";
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
@@ -60,12 +104,36 @@ export interface ResearchEventPayload {
   status?: string;
 }
 
+export interface ResearchJobCancellationResponse {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  cancellation_requested: boolean;
+}
+
 export const researchApi = {
   submit: (payload: ResearchRequest) =>
     apiRequest<ResearchJobAccepted>("/research/jobs", {
       method: "POST",
       body: payload,
     }),
+
+  reviseJob: (jobId: string, question: string) =>
+    apiRequest<ResearchJobAccepted>(
+      `/research/jobs/${encodeURIComponent(jobId)}/revise`,
+      {
+        method: "POST",
+        body: { question },
+      },
+    ),
+
+
+  cancelJob: (jobId: string) =>
+    apiRequest<ResearchJobCancellationResponse>(
+      `/research/jobs/${encodeURIComponent(jobId)}/cancel`,
+      {
+        method: "POST",
+      },
+    ),
 
   getJob: (jobId: string) =>
     apiRequest<ResearchJobResponse>(
@@ -78,6 +146,21 @@ export const researchApi = {
   getConversation: (conversationId: string) =>
     apiRequest<ResearchConversationDetail>(
       `/conversations/${encodeURIComponent(conversationId)}`,
+    ),
+
+  renameConversation: (conversationId: string, title: string) =>
+    apiRequest<ResearchConversationSummary>(
+      `/conversations/${encodeURIComponent(conversationId)}`,
+      {
+        method: "PATCH",
+        body: { title },
+      },
+    ),
+
+  deleteConversation: (conversationId: string) =>
+    apiRequest<void>(
+      `/conversations/${encodeURIComponent(conversationId)}`,
+      { method: "DELETE" },
     ),
 
   // The API returns an events URL for newly accepted jobs. Resolve it against
