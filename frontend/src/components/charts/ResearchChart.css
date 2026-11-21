@@ -1,0 +1,164 @@
+/* Visualization section */
+
+.research-visualizations {
+  min-width: 0;
+  margin-top: 25px;
+  padding-top: 20px;
+  border-top: 1px solid #eeeaf4;
+}
+
+.research-visualizations-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.research-visualizations-heading h2 {
+  margin: 0;
+  color: #332e43;
+  font-size: 15px;
+  font-weight: 750;
+}
+
+.research-visualizations-heading p {
+  margin: 5px 0 0;
+  color: #817b91;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.research-visualizations-heading > span {
+  flex-shrink: 0;
+  padding: 5px 8px;
+  color: #7561c9;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.5px;
+  background: #f2effb;
+  border-radius: 6px;
+}
+
+/* Chart cards */
+
+.research-visualizations-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 15px;
+}
+
+.research-chart-card {
+  min-width: 0;
+  padding: 15px 14px 10px;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #ebe8f1;
+  border-radius: 11px;
+  box-shadow: 0 3px 15px rgb(48 37 87 / 3%);
+}
+
+.research-chart-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.research-chart-heading h3 {
+  margin: 0;
+  color: #39344c;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.5;
+}
+
+.research-chart-heading p {
+  margin: 4px 0 0;
+  color: #898395;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.research-chart-plot {
+  width: 100%;
+  height: 360px;
+  min-width: 0;
+  margin-top: 8px;
+}
+
+.research-chart-plot > div {
+  min-width: 0;
+}
+
+.research-chart-loading,
+.research-chart-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 280px;
+  padding: 20px;
+  color: #827c91;
+  font-size: 11px;
+  text-align: center;
+  background: #faf9fc;
+  border: 1px dashed #e8e4ef;
+  border-radius: 8px;
+}
+
+.research-chart-loading {
+  animation: researchChartPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes researchChartPulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* Visualization warnings */
+
+.research-visualization-warnings {
+  margin-top: 13px;
+  padding: 12px 14px;
+  color: #786438;
+  font-size: 10px;
+  line-height: 1.6;
+  background: #fff9ec;
+  border: 1px solid #f2e8d2;
+  border-radius: 8px;
+}
+
+.research-visualization-warnings strong {
+  font-weight: 750;
+}
+
+.research-visualization-warnings ul {
+  padding-left: 17px;
+  margin: 6px 0 0;
+}
+
+.research-visualization-warnings li {
+  margin: 3px 0;
+}
+
+/* Responsive layout */
+
+@media (max-width: 640px) {
+  .research-visualizations {
+    margin-top: 20px;
+    padding-top: 16px;
+  }
+
+  .research-visualizations-heading h2 {
+    font-size: 13px;
+  }
+
+  .research-chart-card {
+    padding: 12px 8px 8px;
+  }
+
+  .research-chart-plot {
+    height: 320px;
+  }
+}

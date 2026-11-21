@@ -476,12 +476,15 @@ async def get_top_products(
 ) -> list[dict[str, Any]]:
     """Rank products by net line value, optionally restricted by date.
 
-    The limit is restricted to 1–50. Net line value includes negative
-    return and adjustment lines.
+    The limit is restricted by the configured analytics result-row maximum.
+    Net line value includes negative return and adjustment lines.
     """
 
-    if not 1 <= limit <= 50:
-        raise ValueError("limit must be between 1 and 50.")
+    settings = cast(Settings, ctx.lifespan_context["settings"])
+    max_limit = settings.analytics_max_result_rows
+
+    if not 1 <= limit <= max_limit:
+        raise ValueError(f"limit must be between 1 and {max_limit}.")
 
     validate_date_range(start_date, end_date)
     pool = get_pool(ctx)

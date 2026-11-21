@@ -166,3 +166,22 @@ class Settings(BaseSettings):
         ],
         validation_alias="FRONTEND_ORIGINS",
     )
+
+    # User-uploaded datasets
+    dataset_storage_dir: Path = Field(
+        default=PROJECT_ROOT / "data" / "uploads",
+        validation_alias="DATASET_STORAGE_DIR",
+    )
+
+    dataset_max_upload_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        ge=1,
+        validation_alias="DATASET_MAX_UPLOAD_BYTES",
+    )
+
+    # Analytics execution limits
+    analytics_max_result_rows: int = Field(
+        default=10_000,
+        ge=1,
+        validation_alias="ANALYTICS_MAX_RESULT_ROWS",
+    )

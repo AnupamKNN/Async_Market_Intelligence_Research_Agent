@@ -4,6 +4,7 @@ import asyncio
 
 from langchain_core.tools import StructuredTool
 
+from market_intelligence.core.config import Settings
 from market_intelligence.orchestration.graph import build_research_graph
 
 
@@ -165,7 +166,10 @@ def make_gnews_response(
 
 async def test_internal_research_graph_execution():
     tools, calls_started = build_mock_tools()
-    graph = build_research_graph(tools)
+    graph = build_research_graph(
+        tools,
+        settings=Settings(),
+    )
 
     result = await graph.ainvoke(
         {
@@ -240,7 +244,7 @@ async def test_crag_retries_and_accepts_corrected_evidence():
         news_queries=news_queries,
     )
 
-    graph = build_research_graph(tools)
+    graph = build_research_graph(tools, settings=Settings(),)
 
     result = await graph.ainvoke(
         {
@@ -289,7 +293,7 @@ async def test_crag_stops_after_two_retries_and_deduplicates_evidence():
         news_queries=news_queries,
     )
 
-    graph = build_research_graph(tools)
+    graph = build_research_graph(tools, settings=Settings(),)
 
     result = await graph.ainvoke(
         {

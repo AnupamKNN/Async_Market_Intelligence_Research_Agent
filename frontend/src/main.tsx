@@ -12,6 +12,11 @@ import "@fontsource/inter/700.css";
 import "./index.css";
 import App from "./App.tsx";
 
+// Plotly compatibility: provide Node's `global` reference in the browser.
+Object.assign(globalThis, {
+  global: globalThis,
+});
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <App />

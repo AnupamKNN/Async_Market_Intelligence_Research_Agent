@@ -25,6 +25,9 @@ from market_intelligence.db.repositories.auth import initialize_auth_tables
 from market_intelligence.db.repositories.conversations import (
     initialize_research_conversations,
 )
+from market_intelligence.db.repositories.datasets import (
+    initialize_dataset_tables,
+)
 from market_intelligence.db.repositories.research_jobs import (
     initialize_research_jobs,
 )
@@ -63,6 +66,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await initialize_research_jobs(db_pool)
         await initialize_auth_tables(db_pool)
         await initialize_research_conversations(db_pool)
+        await initialize_dataset_tables(db_pool)
 
         app.state.db_pool = db_pool
         app.state.settings = settings
@@ -163,7 +167,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=Settings().frontend_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=[
+        "GET",
+        "POST",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    ],
     allow_headers=["Content-Type", "X-CSRF-Token"],
 )
 
