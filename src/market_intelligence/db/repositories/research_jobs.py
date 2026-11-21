@@ -11,6 +11,7 @@ from market_intelligence.db.repositories.research_outbox import (
 
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_LEASE_DURATION_SECONDS = 120
+RESEARCH_JOBS_MIGRATION_LOCK_ID = 2026111901
 
 
 CREATE_RESEARCH_JOBS_TABLE = """
@@ -75,12 +76,105 @@ WHERE status = 'running'
   AND lease_expires_at IS NULL;
 """
 
+MIGRATE_RESEARCH_JOBS_CANCELLATION = """
+DO $migration$
+DECLARE
+    existing_definition TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid)
+    INTO existing_definition
+    FROM pg_constraint
+    WHERE conrelid = 'research_jobs'::regclass
+      AND conname = 'research_jobs_status_check';
+
+    IF existing_definition IS NULL THEN
+        ALTER TABLE research_jobs
+        ADD CONSTRAINT research_jobs_status_check
+        CHECK (
+            status IN (
+                'queued',
+                'running',
+                'completed',
+                'failed',
+                'cancelled'
+            )
+        );
+
+    ELSIF existing_definition NOT ILIKE '%cancelled%' THEN
+        ALTER TABLE research_jobs
+        DROP CONSTRAINT research_jobs_status_check;
+
+        ALTER TABLE research_jobs
+        ADD CONSTRAINT research_jobs_status_check
+        CHECK (
+            status IN (
+                'queued',
+                'running',
+                'completed',
+                'failed',
+                'cancelled'
+            )
+        );
+    END IF;
+END
+$migration$;
+"""
+
+MIGRATE_RESEARCH_JOBS_REVISIONS = """
+ALTER TABLE research_jobs
+ADD COLUMN IF NOT EXISTS turn_id UUID;
+
+ALTER TABLE research_jobs
+ADD COLUMN IF NOT EXISTS revision_number INTEGER NOT NULL DEFAULT 1;
+
+-- Existing jobs become independent conversational turns.
+UPDATE research_jobs
+SET turn_id = id
+WHERE turn_id IS NULL;
+
+ALTER TABLE research_jobs
+ALTER COLUMN turn_id SET NOT NULL;
+
+DO $migration$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'research_jobs'::regclass
+          AND conname = 'research_jobs_revision_number_check'
+    ) THEN
+        ALTER TABLE research_jobs
+        ADD CONSTRAINT research_jobs_revision_number_check
+        CHECK (revision_number > 0);
+    END IF;
+END
+$migration$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+idx_research_jobs_turn_revision
+ON research_jobs (turn_id, revision_number);
+
+CREATE INDEX IF NOT EXISTS
+idx_research_jobs_conversation_turn
+ON research_jobs (conversation_id, turn_id);
+"""
+
 
 async def initialize_research_jobs(pool: asyncpg.Pool) -> None:
-    """Initialize research jobs storage and apply backward-compatible migrations."""
+    """Initialize research jobs storage and apply serialized migrations."""
 
-    await pool.execute(CREATE_RESEARCH_JOBS_TABLE)
-    await pool.execute(MIGRATE_RESEARCH_JOBS_LEASES)
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                RESEARCH_JOBS_MIGRATION_LOCK_ID,
+            )
+
+            await connection.execute(CREATE_RESEARCH_JOBS_TABLE)
+            await connection.execute(MIGRATE_RESEARCH_JOBS_LEASES)
+            await connection.execute(MIGRATE_RESEARCH_JOBS_CANCELLATION)
+            await connection.execute(MIGRATE_RESEARCH_JOBS_REVISIONS)
+
     await initialize_research_outbox(pool)
 
 
@@ -90,13 +184,20 @@ async def create_research_job(
     payload: dict[str, Any],
     user_id: UUID,
     conversation_id: UUID | None = None,
+    turn_id: UUID | None = None,
+    revision_number: int = 1,
 ) -> None:
     """
     Atomically persist a research job and its Redis publication intent.
 
-    The outbox record is committed only if the research job insert succeeds,
-    and vice versa.
+    A normal new question receives its own turn ID.
+    Subsequent revisions reuse the original turn ID.
     """
+
+    resolved_turn_id = turn_id or job_id
+
+    if revision_number < 1:
+        raise ValueError("Revision number must be positive.")
 
     async with pool.acquire() as connection:
         async with connection.transaction():
@@ -109,22 +210,199 @@ async def create_research_job(
                     question,
                     request_payload,
                     status,
-                    max_attempts
+                    max_attempts,
+                    turn_id,
+                    revision_number
                 )
-                VALUES ($1, $2, $3, $4, $5::jsonb, 'queued', $6)
+                VALUES (
+                    $1, $2, $3, $4, $5::jsonb,
+                    'queued', $6, $7, $8
+                )
                 """,
                 job_id,
                 user_id,
                 conversation_id,
                 payload["question"],
-                json.dumps(payload, ensure_ascii=False, default=str),
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=str,
+                ),
                 DEFAULT_MAX_ATTEMPTS,
+                resolved_turn_id,
+                revision_number,
             )
 
             await insert_research_outbox_record(
                 connection,
                 job_id,
                 payload,
+            )
+
+
+class ResearchJobRevisionConflict(Exception):
+    """Raised when a research job cannot be revised."""
+
+
+async def create_research_job_revision(
+    pool: asyncpg.Pool,
+    new_job_id: UUID,
+    original_job_id: UUID,
+    question: str,
+    user_id: UUID,
+    product_limit: int,
+) -> tuple[UUID, UUID, int] | None:
+    """
+    Create a new execution revision for an existing conversational turn.
+
+    Returns:
+        (conversation_id, turn_id, revision_number)
+
+    Returns None when the original job does not belong to the user.
+
+    The original execution remains unchanged. The new execution and its
+    outbox publication intent are committed in one transaction.
+    """
+
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            original = await connection.fetchrow(
+                """
+                SELECT
+                    id,
+                    user_id,
+                    conversation_id,
+                    turn_id,
+                    revision_number,
+                    status,
+                    request_payload
+                FROM research_jobs
+                WHERE id = $1
+                  AND user_id = $2
+                FOR UPDATE
+                """,
+                original_job_id,
+                user_id,
+            )
+
+            if original is None:
+                return None
+
+            if original["status"] not in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                raise ResearchJobRevisionConflict(
+                    "Only completed, failed, or cancelled research requests can be edited."
+                )
+
+            conversation_id = original["conversation_id"]
+
+            if conversation_id is None:
+                raise ResearchJobRevisionConflict(
+                    "This research request is not associated with a conversation."
+                )
+
+            # Prevent editing an obsolete revision.
+            latest_revision = await connection.fetchval(
+                """
+                SELECT MAX(revision_number)
+                FROM research_jobs
+                WHERE turn_id = $1
+                  AND user_id = $2
+                """,
+                original["turn_id"],
+                user_id,
+            )
+
+            if latest_revision != original["revision_number"]:
+                raise ResearchJobRevisionConflict(
+                    "This message has already been revised. "
+                    "Refresh the conversation before editing it again."
+                )
+
+            # Verify and lock the owning conversation.
+            conversation = await connection.fetchrow(
+                """
+                SELECT id
+                FROM research_conversations
+                WHERE id = $1
+                  AND user_id = $2
+                FOR UPDATE
+                """,
+                conversation_id,
+                user_id,
+            )
+
+            if conversation is None:
+                raise ResearchJobRevisionConflict("The associated conversation no longer exists.")
+
+            original_payload = original["request_payload"]
+
+            if isinstance(original_payload, str):
+                original_payload = json.loads(original_payload)
+
+            # Preserve the original research configuration.
+            revised_payload = dict(original_payload)
+            revised_payload["question"] = question
+            revised_payload["product_limit"] = product_limit
+
+            next_revision = original["revision_number"] + 1
+
+            await connection.execute(
+                """
+                INSERT INTO research_jobs (
+                    id,
+                    user_id,
+                    conversation_id,
+                    question,
+                    request_payload,
+                    status,
+                    max_attempts,
+                    turn_id,
+                    revision_number
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5::jsonb,
+                    'queued', $6, $7, $8
+                )
+                """,
+                new_job_id,
+                user_id,
+                conversation_id,
+                question,
+                json.dumps(
+                    revised_payload,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                DEFAULT_MAX_ATTEMPTS,
+                original["turn_id"],
+                next_revision,
+            )
+
+            await insert_research_outbox_record(
+                connection,
+                new_job_id,
+                revised_payload,
+            )
+
+            await connection.execute(
+                """
+                UPDATE research_conversations
+                SET updated_at = NOW()
+                WHERE id = $1
+                  AND user_id = $2
+                """,
+                conversation_id,
+                user_id,
+            )
+
+            return (
+                conversation_id,
+                original["turn_id"],
+                next_revision,
             )
 
 
@@ -393,6 +671,59 @@ async def fail_research_job(
     )
 
     return row is not None
+
+
+async def cancel_research_job_for_user(
+    pool: asyncpg.Pool,
+    job_id: UUID,
+    user_id: UUID,
+) -> tuple[str, bool] | None:
+    """
+    Cancel a queued or running job belonging to the specified user.
+
+    Returns:
+        (status, True): This call successfully cancelled the job.
+        (status, False): The job already had a terminal status.
+        None: The job does not belong to the specified user.
+    """
+
+    row = await pool.fetchrow(
+        """
+        UPDATE research_jobs
+        SET status = 'cancelled',
+            error = 'Cancelled by user.',
+            completed_at = NOW(),
+            worker_id = NULL,
+            lease_token = NULL,
+            heartbeat_at = NULL,
+            lease_expires_at = NULL
+        WHERE id = $1
+          AND user_id = $2
+          AND status IN ('queued', 'running')
+        RETURNING status
+        """,
+        job_id,
+        user_id,
+    )
+
+    if row is not None:
+        return row["status"], True
+
+    existing = await pool.fetchrow(
+        """
+        SELECT status
+        FROM research_jobs
+        WHERE id = $1
+          AND user_id = $2
+        """,
+        job_id,
+        user_id,
+    )
+
+    if existing is None:
+        return None
+
+    return existing["status"], False
 
 
 async def get_research_job(

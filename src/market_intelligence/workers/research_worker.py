@@ -24,6 +24,9 @@ from market_intelligence.db.repositories.research_jobs import (
 )
 from market_intelligence.mcp.langchain_bridge import MCPToolBridge
 from market_intelligence.orchestration.graph import build_research_graph
+from market_intelligence.orchestration.visualizations import (
+    build_research_visualizations,
+)
 from market_intelligence.services.research_outbox_publisher import (
     run_outbox_publisher,
 )
@@ -47,10 +50,14 @@ logger = logging.getLogger(__name__)
 
 LEASE_DURATION_SECONDS = DEFAULT_LEASE_DURATION_SECONDS
 HEARTBEAT_INTERVAL_SECONDS = max(1, LEASE_DURATION_SECONDS // 3)
+CANCELLATION_POLL_INTERVAL_SECONDS = 1.0
 
 
 class LeaseLostError(RuntimeError):
     """Raised when a worker no longer owns its job lease."""
+
+class JobCancelledError(RuntimeError):
+    """Raised when a user cancels an active research job."""
 
 
 async def publish_event_best_effort(
@@ -104,7 +111,58 @@ async def maintain_job_lease(
             raise LeaseLostError(f"Unable to renew lease for job {job_id}.") from exc
 
         if not renewed:
-            raise LeaseLostError(f"Worker no longer owns the lease for job {job_id}.")
+            job = await get_research_job(pool, job_id)
+
+            if job is not None and job["status"] == "cancelled":
+                raise JobCancelledError(
+                    f"Research job {job_id} was cancelled by the user."
+                )
+
+            raise LeaseLostError(
+                f"Worker no longer owns the lease for job {job_id}."
+            )
+
+async def monitor_job_cancellation(
+    pool: Any,
+    job_id: UUID,
+) -> None:
+    """
+    Poll PostgreSQL for cancellation while the research graph is executing.
+
+    PostgreSQL remains the authoritative source of job state.
+    """
+
+    while True:
+        await asyncio.sleep(CANCELLATION_POLL_INTERVAL_SECONDS)
+
+        try:
+            job = await get_research_job(pool, job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Unable to check cancellation status for job %s.",
+                job_id,
+            )
+            continue
+
+        if job is None:
+            raise LeaseLostError(
+                f"Research job {job_id} no longer exists."
+            )
+
+        current_status = job["status"]
+
+        if current_status == "cancelled":
+            raise JobCancelledError(
+                f"Research job {job_id} was cancelled by the user."
+            )
+
+        if current_status != "running":
+            raise LeaseLostError(
+                f"Research job {job_id} is no longer running. "
+                f"Current status: {current_status}."
+            )
 
 
 async def handle_malformed_queue_message(
@@ -286,15 +344,24 @@ async def execute_research_graph(
         if not report:
             raise RuntimeError("Research graph completed without generating a report.")
 
+        internal_data = final_state.get("internal_data")
+
+        if not isinstance(internal_data, dict):
+            internal_data = {}
+
+        visualizations = build_research_visualizations(
+            internal_data
+        )
+
         return {
             "report": report,
             "analyst_findings": final_state.get("analyst_findings"),
             "collector_findings": final_state.get("collector_findings"),
             "evidence_grade": final_state.get("evidence_grade"),
             "quantitative_analysis": final_state.get("quantitative_analysis"),
+            "visualizations": visualizations,
             "errors": final_state.get("errors", []),
         }
-
 
 async def execute_with_heartbeat(
     job_id: UUID,
@@ -333,9 +400,18 @@ async def execute_with_heartbeat(
         name=f"research-heartbeat-{job_id}",
     )
 
+    cancellation_task = asyncio.create_task(
+        monitor_job_cancellation(
+            pool,
+            job_id,
+        ),
+        name=f"research-cancellation-monitor-{job_id}",
+    )
+
     tasks = [
         execution_task,
         heartbeat_task,
+        cancellation_task,
     ]
 
     if message_id is not None:
@@ -360,8 +436,12 @@ async def execute_with_heartbeat(
             return_when=asyncio.FIRST_COMPLETED,
         )
 
+        # Cancellation takes precedence when multiple tasks finish together.
+        if cancellation_task in done:
+            cancellation_task.result()
+
         # Prefer the graph result if execution has finished.
-        # The conditional database completion still verifies ownership.
+        # Database completion still verifies lease ownership.
         if execution_task in done:
             return execution_task.result()
 
@@ -369,7 +449,9 @@ async def execute_with_heartbeat(
         for task in done:
             task.result()
 
-        raise LeaseLostError(f"A heartbeat stopped unexpectedly for job {job_id}.")
+        raise LeaseLostError(
+            f"A heartbeat stopped unexpectedly for job {job_id}."
+        )
 
     finally:
         for task in tasks:
@@ -450,6 +532,18 @@ async def process_research_job(
             )
             return True
 
+        if current_status == "cancelled":
+            await publish_event_best_effort(
+                redis,
+                job_id,
+                "cancelled",
+                {
+                    "message": "Research was cancelled.",
+                    "status": "cancelled",
+                },
+            )
+            return True
+
         logger.info(
             "Skipping job %s because it is not currently claimable. Current status: %s",
             job_id,
@@ -496,11 +590,30 @@ async def process_research_job(
         )
 
         if not persisted:
+            current_job = await get_research_job(
+                pool,
+                job_id,
+            )
+
+            if current_job is not None and current_job["status"] == "cancelled":
+                await publish_event_best_effort(
+                    redis,
+                    job_id,
+                    "cancelled",
+                    {
+                        "message": "Research was cancelled.",
+                        "status": "cancelled",
+                    },
+                )
+
+                return True
+
             logger.warning(
                 "Job %s produced a result but its lease was no longer "
                 "valid. The result was not persisted by this worker.",
                 job_id,
             )
+
             return False
 
         # PostgreSQL completion succeeds independently of event delivery.
@@ -527,8 +640,24 @@ async def process_research_job(
             worker_id,
             job_id,
         )
+    except JobCancelledError:
+        logger.info(
+            "Research job %s was cancelled. "
+            "Stopping execution without retrying.",
+            job_id,
+        )
 
-        return False
+        await publish_event_best_effort(
+            redis,
+            job_id,
+            "cancelled",
+            {
+                "message": "Research was cancelled.",
+                "status": "cancelled",
+            },
+        )
+
+        return True
 
     except Exception as exc:
         logger.exception(
@@ -544,12 +673,31 @@ async def process_research_job(
         )
 
         if retry_status is None:
+            current_job = await get_research_job(
+                pool,
+                job_id,
+            )
+
+            if current_job is not None and current_job["status"] == "cancelled":
+                await publish_event_best_effort(
+                    redis,
+                    job_id,
+                    "cancelled",
+                    {
+                        "message": "Research was cancelled.",
+                        "status": "cancelled",
+                    },
+                )
+
+                return True
+
             logger.warning(
                 "Worker %s could not schedule another attempt for job %s "
                 "because it no longer owns the lease.",
                 worker_id,
                 job_id,
             )
+
             return False
 
         if retry_status == "queued":

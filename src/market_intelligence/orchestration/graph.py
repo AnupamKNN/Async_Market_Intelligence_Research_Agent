@@ -517,12 +517,13 @@ def build_research_graph(
             "end_date": state["effective_end_date"],
         }
 
-        product_limit = state.get("product_limit", 5)
+        product_limit = state.get("product_limit", 10)
+        max_product_limit = settings.analytics_max_result_rows
 
-        if not 1 <= product_limit <= 50:
+        if not 1 <= product_limit <= max_product_limit:
             return {
                 "internal_data": internal_data,
-                "errors": ["product_limit must be between 1 and 50."],
+                "errors": [f"product_limit must be between 1 and {max_product_limit}."],
             }
 
         requests = {
@@ -1008,7 +1009,7 @@ def build_research_graph(
                     f"| {f'{share}%' if share is not None else 'N/A'} |"
                 )
 
-                monthly = internal.get("monthly_sales_analysis", {})
+        monthly = internal.get("monthly_sales_analysis", {})
 
         if monthly:
             trend = monthly.get("monthly_trend", [])

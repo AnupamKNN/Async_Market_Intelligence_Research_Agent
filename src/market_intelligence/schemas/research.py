@@ -2,11 +2,21 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ResearchRequest(BaseModel):
-    question: str = Field(min_length=10, max_length=5000)
+    question: str = Field(max_length=5000)
+
+    @field_validator("question")
+    @classmethod
+    def validate_question(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Question cannot be empty.")
+
+        return value
 
     conversation_id: UUID | None = None
 
@@ -20,7 +30,28 @@ class ResearchRequest(BaseModel):
     fred_series_ids: list[str] = Field(default_factory=list)
     news_query: str | None = None
     max_articles: int = Field(default=5, ge=1, le=30)
-    product_limit: int = Field(default=5, ge=1, le=50)
+    product_limit: int | None = Field(
+        default=None,
+        ge=1,
+    )
+
+
+class ResearchJobRevisionRequest(BaseModel):
+    question: str = Field(max_length=5000)
+    product_limit: int | None = Field(
+        default=None,
+        ge=1,
+    )
+
+    @field_validator("question")
+    @classmethod
+    def validate_question(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Question cannot be empty.")
+
+        return value
 
 
 class ResearchJobAccepted(BaseModel):
@@ -34,9 +65,27 @@ class ResearchJobAccepted(BaseModel):
 class ResearchJobResponse(BaseModel):
     job_id: UUID
     question: str
-    status: Literal["queued", "running", "completed", "failed"]
+    status: Literal[
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+    ]
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+
+
+class ResearchJobCancellationResponse(BaseModel):
+    job_id: UUID
+    status: Literal[
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+    ]
+    cancellation_requested: bool

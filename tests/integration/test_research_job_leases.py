@@ -6,27 +6,61 @@ import pytest
 
 from market_intelligence.core.config import Settings
 from market_intelligence.db.pool import create_database_pool
+from market_intelligence.db.repositories.auth import (
+    create_email_user,
+    initialize_auth_tables,
+)
 from market_intelligence.db.repositories.research_jobs import (
+    cancel_research_job_for_user,
     claim_research_job,
     complete_research_job,
     fail_research_job,
     heartbeat_research_job,
     initialize_research_jobs,
+    retry_research_job,
 )
 
 
 @pytest.fixture
 async def db_pool():
-    """Create a database pool and ensure the research schema exists."""
+    """Create a database pool and initialize the required schemas."""
 
     pool = await create_database_pool(Settings())
 
     try:
         await initialize_research_jobs(pool)
+        await initialize_auth_tables(pool)
         yield pool
     finally:
         await pool.close()
 
+@pytest.fixture
+async def user_factory(db_pool):
+    """Create isolated users for ownership tests."""
+
+    created_user_ids = []
+
+    async def create_user():
+        user_id = uuid4()
+
+        await create_email_user(
+            db_pool,
+            user_id,
+            f"cancellation-{user_id}@example.test",
+            "Cancellation Test User",
+            "test-password-hash",
+        )
+
+        created_user_ids.append(user_id)
+        return user_id
+
+    yield create_user
+
+    for user_id in created_user_ids:
+        await db_pool.execute(
+            "DELETE FROM users WHERE id = $1",
+            user_id,
+        )
 
 @pytest.fixture
 async def job_factory(db_pool):
@@ -34,7 +68,10 @@ async def job_factory(db_pool):
 
     created_job_ids = []
 
-    async def create_job(max_attempts: int = 3):
+    async def create_job(
+        max_attempts: int = 3,
+        user_id=None,
+    ):
         job_id = uuid4()
 
         await db_pool.execute(
@@ -44,14 +81,20 @@ async def job_factory(db_pool):
                 question,
                 request_payload,
                 status,
-                max_attempts
+                max_attempts,
+                user_id,
+                turn_id,
+                revision_number
             )
-            VALUES ($1, $2, $3::jsonb, 'queued', $4)
+            VALUES ($1, $2, $3::jsonb, 'queued', $4, $5, $1, 1)
             """,
             job_id,
             "Test research job for worker lease validation.",
-            json.dumps({"question": ("Test research job for worker lease validation.")}),
+            json.dumps({
+                "question": "Test research job for worker lease validation."
+            }),
             max_attempts,
+            user_id,
         )
 
         created_job_ids.append(job_id)
@@ -528,3 +571,170 @@ async def test_retry_exhaustion_marks_job_failed(
     assert state["lease_token"] is None
     assert state["error"] == "Second attempt failed."
     assert state["completed_at"] is not None
+
+async def test_owner_can_cancel_queued_job(
+    db_pool,
+    user_factory,
+    job_factory,
+):
+    user_id = await user_factory()
+    job_id = await job_factory(user_id=user_id)
+
+    result = await cancel_research_job_for_user(
+        db_pool,
+        job_id,
+        user_id,
+    )
+
+    assert result == ("cancelled", True)
+
+    state = await get_job_state(db_pool, job_id)
+
+    assert state["status"] == "cancelled"
+    assert state["completed_at"] is not None
+    assert state["error"] == "Cancelled by user."
+    assert state["worker_id"] is None
+    assert state["lease_token"] is None
+
+async def test_owner_can_cancel_running_job_and_invalidate_lease(
+    db_pool,
+    user_factory,
+    job_factory,
+):
+    user_id = await user_factory()
+    job_id = await job_factory(user_id=user_id)
+
+    lease_token = await claim_research_job(
+        db_pool,
+        job_id,
+        "worker-a",
+    )
+
+    assert lease_token is not None
+
+    result = await cancel_research_job_for_user(
+        db_pool,
+        job_id,
+        user_id,
+    )
+
+    assert result == ("cancelled", True)
+
+    state = await get_job_state(db_pool, job_id)
+
+    assert state["status"] == "cancelled"
+    assert state["worker_id"] is None
+    assert state["lease_token"] is None
+    assert state["heartbeat_at"] is None
+    assert state["lease_expires_at"] is None
+
+    # A stale worker must not complete or retry this job.
+    completed = await complete_research_job(
+        db_pool,
+        job_id,
+        {"report": "Late result"},
+        lease_token=lease_token,
+    )
+
+    retried = await retry_research_job(
+        db_pool,
+        job_id,
+        "Late failure",
+        lease_token,
+    )
+
+    assert completed is False
+    assert retried is None
+
+    state = await get_job_state(db_pool, job_id)
+
+    assert state["status"] == "cancelled"
+    assert state["result"] is None
+
+async def test_other_user_cannot_cancel_research_job(
+    db_pool,
+    user_factory,
+    job_factory,
+):
+    owner_id = await user_factory()
+    other_user_id = await user_factory()
+
+    job_id = await job_factory(user_id=owner_id)
+
+    result = await cancel_research_job_for_user(
+        db_pool,
+        job_id,
+        other_user_id,
+    )
+
+    assert result is None
+
+    state = await get_job_state(db_pool, job_id)
+
+    assert state["status"] == "queued"
+    assert state["completed_at"] is None
+
+async def test_completed_job_cannot_be_cancelled(
+    db_pool,
+    user_factory,
+    job_factory,
+):
+    user_id = await user_factory()
+    job_id = await job_factory(user_id=user_id)
+
+    lease_token = await claim_research_job(
+        db_pool,
+        job_id,
+        "worker-a",
+    )
+
+    assert lease_token is not None
+
+    completed = await complete_research_job(
+        db_pool,
+        job_id,
+        {"report": "Successfully completed report"},
+        lease_token=lease_token,
+    )
+
+    assert completed is True
+
+    result = await cancel_research_job_for_user(
+        db_pool,
+        job_id,
+        user_id,
+    )
+
+    assert result == ("completed", False)
+
+    state = await get_job_state(db_pool, job_id)
+
+    assert state["status"] == "completed"
+    assert state["result"]["report"] == "Successfully completed report"
+
+async def test_repeated_job_cancellation_is_idempotent(
+    db_pool,
+    user_factory,
+    job_factory,
+):
+    user_id = await user_factory()
+    job_id = await job_factory(user_id=user_id)
+
+    first_result = await cancel_research_job_for_user(
+        db_pool,
+        job_id,
+        user_id,
+    )
+
+    second_result = await cancel_research_job_for_user(
+        db_pool,
+        job_id,
+        user_id,
+    )
+
+    assert first_result == ("cancelled", True)
+    assert second_result == ("cancelled", False)
+
+    state = await get_job_state(db_pool, job_id)
+
+    assert state["status"] == "cancelled"

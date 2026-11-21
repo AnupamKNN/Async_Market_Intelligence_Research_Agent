@@ -477,3 +477,175 @@ async def test_execute_with_heartbeat_starts_redis_heartbeat(monkeypatch):
             "worker-a",
         )
     ]
+
+
+async def test_job_cancellation_stops_graph_execution(monkeypatch):
+    job_id = uuid4()
+    lease_token = uuid4()
+
+    graph_started = asyncio.Event()
+    graph_cancelled = asyncio.Event()
+
+    async def fake_execute_graph(*args, **kwargs):
+        graph_started.set()
+
+        try:
+            await asyncio.Event().wait()
+        finally:
+            graph_cancelled.set()
+
+    async def fake_heartbeat(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    async def fake_cancellation_monitor(pool, monitored_job_id):
+        assert monitored_job_id == job_id
+        await graph_started.wait()
+
+        raise research_worker.JobCancelledError("Cancelled by test.")
+
+    monkeypatch.setattr(
+        research_worker,
+        "execute_research_graph",
+        fake_execute_graph,
+    )
+
+    monkeypatch.setattr(
+        research_worker,
+        "maintain_job_lease",
+        fake_heartbeat,
+    )
+
+    monkeypatch.setattr(
+        research_worker,
+        "monitor_job_cancellation",
+        fake_cancellation_monitor,
+    )
+
+    with pytest.raises(research_worker.JobCancelledError):
+        await research_worker.execute_with_heartbeat(
+            job_id=job_id,
+            lease_token=lease_token,
+            payload={"question": "Analyze retail performance."},
+            settings=object(),
+            redis=object(),
+            pool=object(),
+        )
+
+    assert graph_started.is_set()
+    assert graph_cancelled.is_set()
+
+
+async def test_cancelled_job_is_acknowledged_without_execution(
+    monkeypatch,
+):
+    job_id = uuid4()
+    published_events = []
+
+    async def fake_claim(*args, **kwargs):
+        return None
+
+    async def fake_get_job(*args, **kwargs):
+        return {"status": "cancelled"}
+
+    async def fake_publish(redis, claimed_job_id, event, data):
+        published_events.append((event, data))
+
+    async def unexpected_execution(*args, **kwargs):
+        raise AssertionError("Cancelled job must not execute.")
+
+    monkeypatch.setattr(
+        research_worker,
+        "claim_research_job",
+        fake_claim,
+    )
+    monkeypatch.setattr(
+        research_worker,
+        "get_research_job",
+        fake_get_job,
+    )
+    monkeypatch.setattr(
+        research_worker,
+        "publish_event_best_effort",
+        fake_publish,
+    )
+    monkeypatch.setattr(
+        research_worker,
+        "execute_with_heartbeat",
+        unexpected_execution,
+    )
+
+    acknowledged = await research_worker.process_research_job(
+        job_id=job_id,
+        payload={"question": "Analyze retail performance."},
+        settings=object(),
+        redis=object(),
+        pool=object(),
+        worker_id="worker-a",
+    )
+
+    assert acknowledged is True
+    assert [event for event, _ in published_events] == ["cancelled"]
+
+
+async def test_runtime_cancellation_does_not_schedule_retry(
+    monkeypatch,
+):
+    job_id = uuid4()
+    lease_token = uuid4()
+    published_events = []
+
+    async def fake_claim(*args, **kwargs):
+        return lease_token
+
+    async def fake_get_job(*args, **kwargs):
+        return {
+            "status": "running",
+            "attempt_count": 1,
+        }
+
+    async def fake_execute(*args, **kwargs):
+        raise research_worker.JobCancelledError("Cancelled by test.")
+
+    async def fake_publish(redis, claimed_job_id, event, data):
+        published_events.append(event)
+
+    async def unexpected_retry(*args, **kwargs):
+        raise AssertionError("A cancelled job must not retry.")
+
+    monkeypatch.setattr(
+        research_worker,
+        "claim_research_job",
+        fake_claim,
+    )
+    monkeypatch.setattr(
+        research_worker,
+        "get_research_job",
+        fake_get_job,
+    )
+    monkeypatch.setattr(
+        research_worker,
+        "execute_with_heartbeat",
+        fake_execute,
+    )
+    monkeypatch.setattr(
+        research_worker,
+        "publish_event_best_effort",
+        fake_publish,
+    )
+    monkeypatch.setattr(
+        research_worker,
+        "retry_research_job",
+        unexpected_retry,
+    )
+
+    acknowledged = await research_worker.process_research_job(
+        job_id=job_id,
+        payload={"question": "Analyze retail performance."},
+        settings=object(),
+        redis=object(),
+        pool=object(),
+        worker_id="worker-a",
+    )
+
+    assert acknowledged is True
+    assert published_events == ["started", "cancelled"]

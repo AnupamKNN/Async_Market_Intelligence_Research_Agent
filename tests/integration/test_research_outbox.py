@@ -7,8 +7,17 @@ import pytest
 from market_intelligence.core.config import Settings
 from market_intelligence.db.pool import create_database_pool
 from market_intelligence.db.repositories import research_jobs
+from market_intelligence.db.repositories.auth import (
+    create_email_user,
+    initialize_auth_tables,
+)
+from market_intelligence.db.repositories.conversations import (
+    create_research_conversation,
+    initialize_research_conversations,
+)
 from market_intelligence.db.repositories.research_jobs import (
     create_research_job,
+    create_research_job_revision,
     initialize_research_jobs,
 )
 from market_intelligence.db.repositories.research_outbox import (
@@ -23,7 +32,10 @@ async def db_pool():
     pool = await create_database_pool(Settings())
 
     try:
+        await initialize_auth_tables(pool)
         await initialize_research_jobs(pool)
+        await initialize_research_conversations(pool)
+
         yield pool
     finally:
         await pool.close()
@@ -275,3 +287,156 @@ async def test_concurrent_publishers_claim_distinct_records(
         first_job,
         second_job,
     }
+
+
+async def test_research_job_revision_persists_updated_product_limit(
+    db_pool,
+):
+    """A revision must preserve the original limit and persist its new limit."""
+
+    user_id = uuid4()
+    conversation_id = uuid4()
+    original_job_id = uuid4()
+    revised_job_id = uuid4()
+
+    job_ids = [original_job_id, revised_job_id]
+
+    try:
+        # Create an isolated user.
+        await create_email_user(
+            db_pool,
+            user_id,
+            f"revision-{user_id}@example.test",
+            "Revision Test User",
+            "test-password-hash",
+        )
+
+        # Create the owning conversation.
+        await create_research_conversation(
+            db_pool,
+            conversation_id,
+            user_id,
+            "Product analysis revision test",
+        )
+
+        # Create the original research job with a limit of 20.
+        await create_research_job(
+            pool=db_pool,
+            job_id=original_job_id,
+            payload={
+                "question": "Find the top 20 products.",
+                "product_limit": 20,
+            },
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+
+        # Revisions are allowed only for terminal jobs.
+        await db_pool.execute(
+            """
+            UPDATE research_jobs
+            SET status = 'completed'
+            WHERE id = $1
+            """,
+            original_job_id,
+        )
+
+        # Create a revision requesting 200 products.
+        revision = await create_research_job_revision(
+            pool=db_pool,
+            new_job_id=revised_job_id,
+            original_job_id=original_job_id,
+            question="Find the top 200 products.",
+            user_id=user_id,
+            product_limit=200,
+        )
+
+        assert revision is not None
+
+        returned_conversation_id, returned_turn_id, revision_number = revision
+
+        assert returned_conversation_id == conversation_id
+        assert returned_turn_id == original_job_id
+        assert revision_number == 2
+
+        # Retrieve both persisted job records.
+        original_row = await db_pool.fetchrow(
+            """
+            SELECT request_payload, revision_number, turn_id
+            FROM research_jobs
+            WHERE id = $1
+            """,
+            original_job_id,
+        )
+
+        revised_row = await db_pool.fetchrow(
+            """
+            SELECT request_payload, revision_number, turn_id
+            FROM research_jobs
+            WHERE id = $1
+            """,
+            revised_job_id,
+        )
+
+        assert original_row is not None
+        assert revised_row is not None
+
+        original_payload = original_row["request_payload"]
+        revised_payload = revised_row["request_payload"]
+
+        if isinstance(original_payload, str):
+            original_payload = json.loads(original_payload)
+
+        if isinstance(revised_payload, str):
+            revised_payload = json.loads(revised_payload)
+
+        # The original execution must remain unchanged.
+        assert original_payload["product_limit"] == 20
+        assert original_row["revision_number"] == 1
+
+        # The new execution must contain the revised limit.
+        assert revised_payload["product_limit"] == 200
+        assert revised_payload["question"] == "Find the top 200 products."
+        assert revised_row["revision_number"] == 2
+        assert revised_row["turn_id"] == original_row["turn_id"]
+
+        # The outbox must publish the same revised payload.
+        outbox_row = await db_pool.fetchrow(
+            """
+            SELECT payload
+            FROM research_outbox
+            WHERE job_id = $1
+            """,
+            revised_job_id,
+        )
+
+        assert outbox_row is not None
+
+        outbox_payload = outbox_row["payload"]
+
+        if isinstance(outbox_payload, str):
+            outbox_payload = json.loads(outbox_payload)
+
+        assert outbox_payload == revised_payload
+
+    finally:
+        # Clean up all records created by this test.
+        await db_pool.execute(
+            "DELETE FROM research_outbox WHERE job_id = ANY($1::uuid[])",
+            job_ids,
+        )
+
+        await db_pool.execute(
+            "DELETE FROM research_jobs WHERE id = ANY($1::uuid[])",
+            job_ids,
+        )
+
+        await db_pool.execute(
+            "DELETE FROM research_conversations WHERE id = $1",
+            conversation_id,
+        )
+
+        await db_pool.execute(
+            "DELETE FROM users WHERE id = $1",
+            user_id,
+        )
