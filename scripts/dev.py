@@ -8,7 +8,10 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 HOST = "127.0.0.1"
 PORT = 8000
 
